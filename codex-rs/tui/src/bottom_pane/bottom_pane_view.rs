@@ -1,12 +1,12 @@
 use crate::bottom_pane::ApprovalRequest;
+use crate::render::renderable::Renderable;
+use codex_protocol::request_user_input::RequestUserInputEvent;
 use crossterm::event::KeyEvent;
-use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
 
 use super::CancellationEvent;
 
 /// Trait implemented by every view that can be shown in the bottom pane.
-pub(crate) trait BottomPaneView {
+pub(crate) trait BottomPaneView: Renderable {
     /// Handle a key event while the view is active. A redraw is always
     /// scheduled after this call.
     fn handle_key_event(&mut self, _key_event: KeyEvent) {}
@@ -16,16 +16,21 @@ pub(crate) trait BottomPaneView {
         false
     }
 
+    /// Stable identifier for views that need external refreshes while open.
+    fn view_id(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Handle Ctrl-C while this view is active.
     fn on_ctrl_c(&mut self) -> CancellationEvent {
         CancellationEvent::NotHandled
     }
 
-    /// Return the desired height of the view.
-    fn desired_height(&self, width: u16) -> u16;
-
-    /// Render the view: this will be displayed in place of the composer.
-    fn render(&self, area: Rect, buf: &mut Buffer);
+    /// Return true if Esc should be routed through `handle_key_event` instead
+    /// of the `on_ctrl_c` cancellation path.
+    fn prefer_esc_to_handle_key_event(&self) -> bool {
+        false
+    }
 
     /// Optional paste handler. Return true if the view modified its state and
     /// needs a redraw.
@@ -33,9 +38,20 @@ pub(crate) trait BottomPaneView {
         false
     }
 
-    /// Cursor position when this view is active.
-    fn cursor_pos(&self, _area: Rect) -> Option<(u16, u16)> {
-        None
+    /// Flush any pending paste-burst state. Return true if state changed.
+    ///
+    /// This lets a modal that reuses `ChatComposer` participate in the same
+    /// time-based paste burst flushing as the primary composer.
+    fn flush_paste_burst_if_due(&mut self) -> bool {
+        false
+    }
+
+    /// Whether the view is currently holding paste-burst transient state.
+    ///
+    /// When `true`, the bottom pane will schedule a short delayed redraw to
+    /// give the burst time window a chance to flush.
+    fn is_in_paste_burst(&self) -> bool {
+        false
     }
 
     /// Try to handle approval request; return the original value if not
@@ -44,6 +60,15 @@ pub(crate) trait BottomPaneView {
         &mut self,
         request: ApprovalRequest,
     ) -> Option<ApprovalRequest> {
+        Some(request)
+    }
+
+    /// Try to handle request_user_input; return the original value if not
+    /// consumed.
+    fn try_consume_user_input_request(
+        &mut self,
+        request: RequestUserInputEvent,
+    ) -> Option<RequestUserInputEvent> {
         Some(request)
     }
 }

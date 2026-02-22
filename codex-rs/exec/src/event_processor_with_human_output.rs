@@ -1,50 +1,59 @@
-use codex_common::elapsed::format_duration;
-use codex_common::elapsed::format_elapsed;
 use codex_core::config::Config;
-use codex_core::plan_tool::UpdatePlanArgs;
-use codex_core::protocol::AgentMessageDeltaEvent;
-use codex_core::protocol::AgentMessageEvent;
-use codex_core::protocol::AgentReasoningDeltaEvent;
-use codex_core::protocol::AgentReasoningRawContentDeltaEvent;
-use codex_core::protocol::AgentReasoningRawContentEvent;
-use codex_core::protocol::BackgroundEventEvent;
-use codex_core::protocol::ErrorEvent;
-use codex_core::protocol::Event;
-use codex_core::protocol::EventMsg;
-use codex_core::protocol::ExecCommandBeginEvent;
-use codex_core::protocol::ExecCommandEndEvent;
-use codex_core::protocol::FileChange;
-use codex_core::protocol::McpInvocation;
-use codex_core::protocol::McpToolCallBeginEvent;
-use codex_core::protocol::McpToolCallEndEvent;
-use codex_core::protocol::PatchApplyBeginEvent;
-use codex_core::protocol::PatchApplyEndEvent;
-use codex_core::protocol::SessionConfiguredEvent;
-use codex_core::protocol::StreamErrorEvent;
-use codex_core::protocol::TaskCompleteEvent;
-use codex_core::protocol::TurnAbortReason;
-use codex_core::protocol::TurnDiffEvent;
-use codex_core::protocol::WebSearchBeginEvent;
-use codex_core::protocol::WebSearchEndEvent;
+use codex_core::web_search::web_search_detail;
+use codex_protocol::items::TurnItem;
 use codex_protocol::num_format::format_with_separators;
+use codex_protocol::protocol::AgentMessageEvent;
+use codex_protocol::protocol::AgentReasoningRawContentEvent;
+use codex_protocol::protocol::AgentStatus;
+use codex_protocol::protocol::BackgroundEventEvent;
+use codex_protocol::protocol::CollabAgentInteractionBeginEvent;
+use codex_protocol::protocol::CollabAgentInteractionEndEvent;
+use codex_protocol::protocol::CollabAgentSpawnBeginEvent;
+use codex_protocol::protocol::CollabAgentSpawnEndEvent;
+use codex_protocol::protocol::CollabCloseBeginEvent;
+use codex_protocol::protocol::CollabCloseEndEvent;
+use codex_protocol::protocol::CollabWaitingBeginEvent;
+use codex_protocol::protocol::CollabWaitingEndEvent;
+use codex_protocol::protocol::DeprecationNoticeEvent;
+use codex_protocol::protocol::ErrorEvent;
+use codex_protocol::protocol::Event;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::ExecCommandBeginEvent;
+use codex_protocol::protocol::ExecCommandEndEvent;
+use codex_protocol::protocol::FileChange;
+use codex_protocol::protocol::ItemCompletedEvent;
+use codex_protocol::protocol::McpInvocation;
+use codex_protocol::protocol::McpToolCallBeginEvent;
+use codex_protocol::protocol::McpToolCallEndEvent;
+use codex_protocol::protocol::PatchApplyBeginEvent;
+use codex_protocol::protocol::PatchApplyEndEvent;
+use codex_protocol::protocol::SessionConfiguredEvent;
+use codex_protocol::protocol::StreamErrorEvent;
+use codex_protocol::protocol::TurnAbortReason;
+use codex_protocol::protocol::TurnCompleteEvent;
+use codex_protocol::protocol::TurnDiffEvent;
+use codex_protocol::protocol::WarningEvent;
+use codex_protocol::protocol::WebSearchEndEvent;
+use codex_utils_elapsed::format_duration;
+use codex_utils_elapsed::format_elapsed;
 use owo_colors::OwoColorize;
 use owo_colors::Style;
 use shlex::try_join;
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::PathBuf;
 use std::time::Instant;
 
 use crate::event_processor::CodexStatus;
 use crate::event_processor::EventProcessor;
 use crate::event_processor::handle_last_message;
-use codex_common::create_config_summary_entries;
+use codex_protocol::plan_tool::StepStatus;
+use codex_protocol::plan_tool::UpdatePlanArgs;
+use codex_utils_sandbox_summary::create_config_summary_entries;
 
 /// This should be configurable. When used in CI, users may not want to impose
 /// a limit so they can see the full transcript.
 const MAX_OUTPUT_LINES_FOR_EXEC_TOOL_CALL: usize = 20;
 pub(crate) struct EventProcessorWithHumanOutput {
-    call_id_to_command: HashMap<String, ExecCommandBegin>,
     call_id_to_patch: HashMap<String, PatchApplyBegin>,
 
     // To ensure that --color=never is respected, ANSI escapes _must_ be added
@@ -58,14 +67,15 @@ pub(crate) struct EventProcessorWithHumanOutput {
     red: Style,
     green: Style,
     cyan: Style,
+    yellow: Style,
 
     /// Whether to include `AgentReasoning` events in the output.
     show_agent_reasoning: bool,
     show_raw_agent_reasoning: bool,
-    answer_started: bool,
-    reasoning_started: bool,
-    raw_reasoning_started: bool,
     last_message_path: Option<PathBuf>,
+    last_total_token_usage: Option<codex_protocol::protocol::TokenUsageInfo>,
+    final_message: Option<String>,
+    last_proposed_plan: Option<String>,
 }
 
 impl EventProcessorWithHumanOutput {
@@ -74,12 +84,10 @@ impl EventProcessorWithHumanOutput {
         config: &Config,
         last_message_path: Option<PathBuf>,
     ) -> Self {
-        let call_id_to_command = HashMap::new();
         let call_id_to_patch = HashMap::new();
 
         if with_ansi {
             Self {
-                call_id_to_command,
                 call_id_to_patch,
                 bold: Style::new().bold(),
                 italic: Style::new().italic(),
@@ -88,16 +96,16 @@ impl EventProcessorWithHumanOutput {
                 red: Style::new().red(),
                 green: Style::new().green(),
                 cyan: Style::new().cyan(),
+                yellow: Style::new().yellow(),
                 show_agent_reasoning: !config.hide_agent_reasoning,
                 show_raw_agent_reasoning: config.show_raw_agent_reasoning,
-                answer_started: false,
-                reasoning_started: false,
-                raw_reasoning_started: false,
                 last_message_path,
+                last_total_token_usage: None,
+                final_message: None,
+                last_proposed_plan: None,
             }
         } else {
             Self {
-                call_id_to_command,
                 call_id_to_patch,
                 bold: Style::new(),
                 italic: Style::new(),
@@ -106,19 +114,16 @@ impl EventProcessorWithHumanOutput {
                 red: Style::new(),
                 green: Style::new(),
                 cyan: Style::new(),
+                yellow: Style::new(),
                 show_agent_reasoning: !config.hide_agent_reasoning,
                 show_raw_agent_reasoning: config.show_raw_agent_reasoning,
-                answer_started: false,
-                reasoning_started: false,
-                raw_reasoning_started: false,
                 last_message_path,
+                last_total_token_usage: None,
+                final_message: None,
+                last_proposed_plan: None,
             }
         }
     }
-}
-
-struct ExecCommandBegin {
-    command: Vec<String>,
 }
 
 struct PatchApplyBegin {
@@ -126,14 +131,10 @@ struct PatchApplyBegin {
     auto_approved: bool,
 }
 
-// Timestamped println helper. The timestamp is styled with self.dimmed.
-#[macro_export]
-macro_rules! ts_println {
+/// Timestamped helper. The timestamp is styled with self.dimmed.
+macro_rules! ts_msg {
     ($self:ident, $($arg:tt)*) => {{
-        let now = chrono::Utc::now();
-        let formatted = now.format("[%Y-%m-%dT%H:%M:%S]");
-        print!("{} ", formatted.style($self.dimmed));
-        println!($($arg)*);
+        eprintln!($($arg)*);
     }};
 }
 
@@ -141,176 +142,194 @@ impl EventProcessor for EventProcessorWithHumanOutput {
     /// Print a concise summary of the effective configuration that will be used
     /// for the session. This mirrors the information shown in the TUI welcome
     /// screen.
-    fn print_config_summary(&mut self, config: &Config, prompt: &str, _: &SessionConfiguredEvent) {
+    fn print_config_summary(
+        &mut self,
+        config: &Config,
+        prompt: &str,
+        session_configured_event: &SessionConfiguredEvent,
+    ) {
         const VERSION: &str = env!("CARGO_PKG_VERSION");
-        ts_println!(
+        ts_msg!(
             self,
             "OpenAI Codex v{} (research preview)\n--------",
             VERSION
         );
 
-        let entries = create_config_summary_entries(config);
+        let mut entries =
+            create_config_summary_entries(config, session_configured_event.model.as_str());
+        entries.push((
+            "session id",
+            session_configured_event.session_id.to_string(),
+        ));
 
         for (key, value) in entries {
-            println!("{} {}", format!("{key}:").style(self.bold), value);
+            eprintln!("{} {}", format!("{key}:").style(self.bold), value);
         }
 
-        println!("--------");
+        eprintln!("--------");
 
         // Echo the prompt that will be sent to the agent so it is visible in the
         // transcript/logs before any events come in. Note the prompt may have been
         // read from stdin, so it may not be visible in the terminal otherwise.
-        ts_println!(
-            self,
-            "{}\n{}",
-            "User instructions:".style(self.bold).style(self.cyan),
-            prompt
-        );
+        ts_msg!(self, "{}\n{}", "user".style(self.cyan), prompt);
     }
 
     fn process_event(&mut self, event: Event) -> CodexStatus {
         let Event { id: _, msg } = event;
         match msg {
-            EventMsg::Error(ErrorEvent { message }) => {
+            EventMsg::Error(ErrorEvent { message, .. }) => {
                 let prefix = "ERROR:".style(self.red);
-                ts_println!(self, "{prefix} {message}");
+                ts_msg!(self, "{prefix} {message}");
+            }
+            EventMsg::Warning(WarningEvent { message }) => {
+                ts_msg!(
+                    self,
+                    "{} {message}",
+                    "warning:".style(self.yellow).style(self.bold)
+                );
+            }
+            EventMsg::ModelReroute(_) => {}
+            EventMsg::DeprecationNotice(DeprecationNoticeEvent { summary, details }) => {
+                ts_msg!(
+                    self,
+                    "{} {summary}",
+                    "deprecated:".style(self.magenta).style(self.bold)
+                );
+                if let Some(details) = details {
+                    ts_msg!(self, "  {}", details.style(self.dimmed));
+                }
+            }
+            EventMsg::McpStartupUpdate(update) => {
+                let status_text = match update.status {
+                    codex_protocol::protocol::McpStartupStatus::Starting => "starting".to_string(),
+                    codex_protocol::protocol::McpStartupStatus::Ready => "ready".to_string(),
+                    codex_protocol::protocol::McpStartupStatus::Cancelled => {
+                        "cancelled".to_string()
+                    }
+                    codex_protocol::protocol::McpStartupStatus::Failed { ref error } => {
+                        format!("failed: {error}")
+                    }
+                };
+                ts_msg!(
+                    self,
+                    "{} {} {}",
+                    "mcp:".style(self.cyan),
+                    update.server,
+                    status_text
+                );
+            }
+            EventMsg::McpStartupComplete(summary) => {
+                let mut parts = Vec::new();
+                if !summary.ready.is_empty() {
+                    parts.push(format!("ready: {}", summary.ready.join(", ")));
+                }
+                if !summary.failed.is_empty() {
+                    let servers: Vec<_> = summary.failed.iter().map(|f| f.server.clone()).collect();
+                    parts.push(format!("failed: {}", servers.join(", ")));
+                }
+                if !summary.cancelled.is_empty() {
+                    parts.push(format!("cancelled: {}", summary.cancelled.join(", ")));
+                }
+                let joined = if parts.is_empty() {
+                    "no servers".to_string()
+                } else {
+                    parts.join("; ")
+                };
+                ts_msg!(self, "{} {}", "mcp startup:".style(self.cyan), joined);
             }
             EventMsg::BackgroundEvent(BackgroundEventEvent { message }) => {
-                ts_println!(self, "{}", message.style(self.dimmed));
+                ts_msg!(self, "{}", message.style(self.dimmed));
             }
-            EventMsg::StreamError(StreamErrorEvent { message }) => {
-                ts_println!(self, "{}", message.style(self.dimmed));
+            EventMsg::StreamError(StreamErrorEvent {
+                message,
+                additional_details,
+                ..
+            }) => {
+                let message = match additional_details {
+                    Some(details) if !details.trim().is_empty() => format!("{message} ({details})"),
+                    _ => message,
+                };
+                ts_msg!(self, "{}", message.style(self.dimmed));
             }
-            EventMsg::TaskStarted(_) => {
+            EventMsg::TurnStarted(_) => {
                 // Ignore.
             }
-            EventMsg::TaskComplete(TaskCompleteEvent { last_agent_message }) => {
+            EventMsg::ElicitationRequest(ev) => {
+                ts_msg!(
+                    self,
+                    "{} {}",
+                    "elicitation request".style(self.magenta),
+                    ev.server_name.style(self.dimmed)
+                );
+                ts_msg!(
+                    self,
+                    "{}",
+                    "auto-cancelling (not supported in exec mode)".style(self.dimmed)
+                );
+            }
+            EventMsg::TurnComplete(TurnCompleteEvent {
+                last_agent_message, ..
+            }) => {
+                let last_message = last_agent_message
+                    .as_deref()
+                    .or(self.last_proposed_plan.as_deref());
                 if let Some(output_file) = self.last_message_path.as_deref() {
-                    handle_last_message(last_agent_message.as_deref(), output_file);
+                    handle_last_message(last_message, output_file);
                 }
+
+                self.final_message = last_agent_message.or_else(|| self.last_proposed_plan.clone());
+
                 return CodexStatus::InitiateShutdown;
             }
             EventMsg::TokenCount(ev) => {
-                if let Some(usage_info) = ev.info {
-                    ts_println!(
-                        self,
-                        "tokens used: {}",
-                        format_with_separators(usage_info.total_token_usage.blended_total())
-                    );
-                }
+                self.last_total_token_usage = ev.info;
             }
-            EventMsg::AgentMessageDelta(AgentMessageDeltaEvent { delta }) => {
-                if !self.answer_started {
-                    ts_println!(self, "{}\n", "codex".style(self.italic).style(self.magenta));
-                    self.answer_started = true;
-                }
-                print!("{delta}");
-                #[expect(clippy::expect_used)]
-                std::io::stdout().flush().expect("could not flush stdout");
-            }
-            EventMsg::AgentReasoningDelta(AgentReasoningDeltaEvent { delta }) => {
-                if !self.show_agent_reasoning {
-                    return CodexStatus::Running;
-                }
-                if !self.reasoning_started {
-                    ts_println!(
-                        self,
-                        "{}\n",
-                        "thinking".style(self.italic).style(self.magenta),
-                    );
-                    self.reasoning_started = true;
-                }
-                print!("{delta}");
-                #[expect(clippy::expect_used)]
-                std::io::stdout().flush().expect("could not flush stdout");
-            }
+
             EventMsg::AgentReasoningSectionBreak(_) => {
                 if !self.show_agent_reasoning {
                     return CodexStatus::Running;
                 }
-                println!();
-                #[expect(clippy::expect_used)]
-                std::io::stdout().flush().expect("could not flush stdout");
+                eprintln!();
             }
             EventMsg::AgentReasoningRawContent(AgentReasoningRawContentEvent { text }) => {
-                if !self.show_raw_agent_reasoning {
-                    return CodexStatus::Running;
-                }
-                if !self.raw_reasoning_started {
-                    print!("{text}");
-                    #[expect(clippy::expect_used)]
-                    std::io::stdout().flush().expect("could not flush stdout");
-                } else {
-                    println!();
-                    self.raw_reasoning_started = false;
-                }
-            }
-            EventMsg::AgentReasoningRawContentDelta(AgentReasoningRawContentDeltaEvent {
-                delta,
-            }) => {
-                if !self.show_raw_agent_reasoning {
-                    return CodexStatus::Running;
-                }
-                if !self.raw_reasoning_started {
-                    self.raw_reasoning_started = true;
-                }
-                print!("{delta}");
-                #[expect(clippy::expect_used)]
-                std::io::stdout().flush().expect("could not flush stdout");
-            }
-            EventMsg::AgentMessage(AgentMessageEvent { message }) => {
-                // if answer_started is false, this means we haven't received any
-                // delta. Thus, we need to print the message as a new answer.
-                if !self.answer_started {
-                    ts_println!(
+                if self.show_raw_agent_reasoning {
+                    ts_msg!(
                         self,
                         "{}\n{}",
-                        "codex".style(self.italic).style(self.magenta),
-                        message,
+                        "thinking".style(self.italic).style(self.magenta),
+                        text,
                     );
-                } else {
-                    println!();
-                    self.answer_started = false;
                 }
             }
-            EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
-                call_id,
-                command,
-                cwd,
-                parsed_cmd: _,
-            }) => {
-                self.call_id_to_command.insert(
-                    call_id,
-                    ExecCommandBegin {
-                        command: command.clone(),
-                    },
-                );
-                ts_println!(
+            EventMsg::AgentMessage(AgentMessageEvent { message, .. }) => {
+                ts_msg!(
                     self,
-                    "{} {} in {}",
-                    "exec".style(self.magenta),
+                    "{}\n{}",
+                    "codex".style(self.italic).style(self.magenta),
+                    message,
+                );
+            }
+            EventMsg::ItemCompleted(ItemCompletedEvent {
+                item: TurnItem::Plan(item),
+                ..
+            }) => {
+                self.last_proposed_plan = Some(item.text);
+            }
+            EventMsg::ExecCommandBegin(ExecCommandBeginEvent { command, cwd, .. }) => {
+                eprint!(
+                    "{}\n{} in {}",
+                    "exec".style(self.italic).style(self.magenta),
                     escape_command(&command).style(self.bold),
                     cwd.to_string_lossy(),
                 );
             }
-            EventMsg::ExecCommandOutputDelta(_) => {}
             EventMsg::ExecCommandEnd(ExecCommandEndEvent {
-                call_id,
                 aggregated_output,
                 duration,
                 exit_code,
                 ..
             }) => {
-                let exec_command = self.call_id_to_command.remove(&call_id);
-                let (duration, call) = if let Some(ExecCommandBegin { command, .. }) = exec_command
-                {
-                    (
-                        format!(" in {}", format_duration(duration)),
-                        format!("{}", escape_command(&command).style(self.bold)),
-                    )
-                } else {
-                    ("".to_string(), format!("exec('{call_id}')"))
-                };
+                let duration = format!(" in {}", format_duration(duration));
 
                 let truncated_output = aggregated_output
                     .lines()
@@ -319,21 +338,21 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                     .join("\n");
                 match exit_code {
                     0 => {
-                        let title = format!("{call} succeeded{duration}:");
-                        ts_println!(self, "{}", title.style(self.green));
+                        let title = format!(" succeeded{duration}:");
+                        ts_msg!(self, "{}", title.style(self.green));
                     }
                     _ => {
-                        let title = format!("{call} exited {exit_code}{duration}:");
-                        ts_println!(self, "{}", title.style(self.red));
+                        let title = format!(" exited {exit_code}{duration}:");
+                        ts_msg!(self, "{}", title.style(self.red));
                     }
                 }
-                println!("{}", truncated_output.style(self.dimmed));
+                eprintln!("{}", truncated_output.style(self.dimmed));
             }
             EventMsg::McpToolCallBegin(McpToolCallBeginEvent {
                 call_id: _,
                 invocation,
             }) => {
-                ts_println!(
+                ts_msg!(
                     self,
                     "{} {}",
                     "tool".style(self.magenta),
@@ -358,26 +377,39 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                     format_mcp_invocation(&invocation)
                 );
 
-                ts_println!(self, "{}", title.style(title_style));
+                ts_msg!(self, "{}", title.style(title_style));
 
                 if let Ok(res) = result {
-                    let val: serde_json::Value = res.into();
+                    let val = serde_json::to_value(res)
+                        .unwrap_or_else(|_| serde_json::Value::String("<result>".to_string()));
                     let pretty =
                         serde_json::to_string_pretty(&val).unwrap_or_else(|_| val.to_string());
 
                     for line in pretty.lines().take(MAX_OUTPUT_LINES_FOR_EXEC_TOOL_CALL) {
-                        println!("{}", line.style(self.dimmed));
+                        eprintln!("{}", line.style(self.dimmed));
                     }
                 }
             }
-            EventMsg::WebSearchBegin(WebSearchBeginEvent { call_id: _ }) => {}
-            EventMsg::WebSearchEnd(WebSearchEndEvent { call_id: _, query }) => {
-                ts_println!(self, "🌐 Searched: {query}");
+            EventMsg::WebSearchBegin(_) => {
+                ts_msg!(self, "🌐 Searching the web...");
+            }
+            EventMsg::WebSearchEnd(WebSearchEndEvent {
+                call_id: _,
+                query,
+                action,
+            }) => {
+                let detail = web_search_detail(Some(&action), &query);
+                if detail.is_empty() {
+                    ts_msg!(self, "🌐 Searched the web");
+                } else {
+                    ts_msg!(self, "🌐 Searched: {detail}");
+                }
             }
             EventMsg::PatchApplyBegin(PatchApplyBeginEvent {
                 call_id,
                 auto_approved,
                 changes,
+                ..
             }) => {
                 // Store metadata so we can calculate duration later when we
                 // receive the corresponding PatchApplyEnd event.
@@ -389,11 +421,10 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                     },
                 );
 
-                ts_println!(
+                ts_msg!(
                     self,
-                    "{} auto_approved={}:",
-                    "apply_patch".style(self.magenta),
-                    auto_approved,
+                    "{}",
+                    "file update".style(self.magenta).style(self.italic),
                 );
 
                 // Pretty-print the patch summary with colored diff markers so
@@ -406,9 +437,9 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                                 format_file_change(change),
                                 path.to_string_lossy()
                             );
-                            println!("{}", header.style(self.magenta));
+                            eprintln!("{}", header.style(self.magenta));
                             for line in content.lines() {
-                                println!("{}", line.style(self.green));
+                                eprintln!("{}", line.style(self.green));
                             }
                         }
                         FileChange::Delete { content } => {
@@ -417,9 +448,9 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                                 format_file_change(change),
                                 path.to_string_lossy()
                             );
-                            println!("{}", header.style(self.magenta));
+                            eprintln!("{}", header.style(self.magenta));
                             for line in content.lines() {
-                                println!("{}", line.style(self.red));
+                                eprintln!("{}", line.style(self.red));
                             }
                         }
                         FileChange::Update {
@@ -436,20 +467,20 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                             } else {
                                 format!("{} {}", format_file_change(change), path.to_string_lossy())
                             };
-                            println!("{}", header.style(self.magenta));
+                            eprintln!("{}", header.style(self.magenta));
 
                             // Colorize diff lines. We keep file header lines
                             // (--- / +++) without extra coloring so they are
                             // still readable.
                             for diff_line in unified_diff.lines() {
                                 if diff_line.starts_with('+') && !diff_line.starts_with("+++") {
-                                    println!("{}", diff_line.style(self.green));
+                                    eprintln!("{}", diff_line.style(self.green));
                                 } else if diff_line.starts_with('-')
                                     && !diff_line.starts_with("---")
                                 {
-                                    println!("{}", diff_line.style(self.red));
+                                    eprintln!("{}", diff_line.style(self.red));
                                 } else {
-                                    println!("{diff_line}");
+                                    eprintln!("{diff_line}");
                                 }
                             }
                         }
@@ -486,82 +517,70 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                 };
 
                 let title = format!("{label} exited {exit_code}{duration}:");
-                ts_println!(self, "{}", title.style(title_style));
+                ts_msg!(self, "{}", title.style(title_style));
                 for line in output.lines() {
-                    println!("{}", line.style(self.dimmed));
+                    eprintln!("{}", line.style(self.dimmed));
                 }
             }
             EventMsg::TurnDiff(TurnDiffEvent { unified_diff }) => {
-                ts_println!(self, "{}", "turn diff:".style(self.magenta));
-                println!("{unified_diff}");
-            }
-            EventMsg::ExecApprovalRequest(_) => {
-                // Should we exit?
-            }
-            EventMsg::ApplyPatchApprovalRequest(_) => {
-                // Should we exit?
+                ts_msg!(
+                    self,
+                    "{}",
+                    "file update:".style(self.magenta).style(self.italic)
+                );
+                eprintln!("{unified_diff}");
             }
             EventMsg::AgentReasoning(agent_reasoning_event) => {
                 if self.show_agent_reasoning {
-                    if !self.reasoning_started {
-                        ts_println!(
-                            self,
-                            "{}\n{}",
-                            "codex".style(self.italic).style(self.magenta),
-                            agent_reasoning_event.text,
-                        );
-                    } else {
-                        println!();
-                        self.reasoning_started = false;
-                    }
+                    ts_msg!(
+                        self,
+                        "{}\n{}",
+                        "thinking".style(self.italic).style(self.magenta),
+                        agent_reasoning_event.text,
+                    );
                 }
             }
             EventMsg::SessionConfigured(session_configured_event) => {
                 let SessionConfiguredEvent {
                     session_id: conversation_id,
                     model,
-                    reasoning_effort: _,
-                    history_log_id: _,
-                    history_entry_count: _,
-                    initial_messages: _,
-                    rollout_path: _,
+                    ..
                 } = session_configured_event;
 
-                ts_println!(
+                ts_msg!(
                     self,
                     "{} {}",
                     "codex session".style(self.magenta).style(self.bold),
                     conversation_id.to_string().style(self.dimmed)
                 );
 
-                ts_println!(self, "model: {}", model);
-                println!();
+                ts_msg!(self, "model: {}", model);
+                eprintln!();
             }
             EventMsg::PlanUpdate(plan_update_event) => {
                 let UpdatePlanArgs { explanation, plan } = plan_update_event;
 
                 // Header
-                ts_println!(self, "{}", "Plan update".style(self.magenta));
+                ts_msg!(self, "{}", "Plan update".style(self.magenta));
 
                 // Optional explanation
                 if let Some(explanation) = explanation
                     && !explanation.trim().is_empty()
                 {
-                    ts_println!(self, "{}", explanation.style(self.italic));
+                    ts_msg!(self, "{}", explanation.style(self.italic));
                 }
 
                 // Pretty-print the plan items with simple status markers.
                 for item in plan {
-                    use codex_core::plan_tool::StepStatus;
                     match item.status {
                         StepStatus::Completed => {
-                            ts_println!(self, "  {} {}", "✓".style(self.green), item.step);
+                            ts_msg!(self, "  {} {}", "✓".style(self.green), item.step);
                         }
                         StepStatus::InProgress => {
-                            ts_println!(self, "  {} {}", "→".style(self.cyan), item.step);
+                            ts_msg!(self, "  {} {}", "→".style(self.cyan), item.step);
                         }
                         StepStatus::Pending => {
-                            ts_println!(
+                            ts_msg!(
                                 self,
                                 "  {} {}",
                                 "•".style(self.dimmed),
@@ -571,33 +590,253 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                     }
                 }
             }
-            EventMsg::GetHistoryEntryResponse(_) => {
-                // Currently ignored in exec output.
+            EventMsg::ViewImageToolCall(view) => {
+                ts_msg!(
+                    self,
+                    "{} {}",
+                    "viewed image".style(self.magenta),
+                    view.path.display()
+                );
             }
-            EventMsg::McpListToolsResponse(_) => {
-                // Currently ignored in exec output.
+            EventMsg::TurnAborted(abort_reason) => {
+                match abort_reason.reason {
+                    TurnAbortReason::Interrupted => {
+                        ts_msg!(self, "task interrupted");
+                    }
+                    TurnAbortReason::Replaced => {
+                        ts_msg!(self, "task aborted: replaced by a new task");
+                    }
+                    TurnAbortReason::ReviewEnded => {
+                        ts_msg!(self, "task aborted: review ended");
+                    }
+                }
+                return CodexStatus::InitiateShutdown;
             }
-            EventMsg::ListCustomPromptsResponse(_) => {
-                // Currently ignored in exec output.
+            EventMsg::ContextCompacted(_) => {
+                ts_msg!(self, "context compacted");
             }
-            EventMsg::TurnAborted(abort_reason) => match abort_reason.reason {
-                TurnAbortReason::Interrupted => {
-                    ts_println!(self, "task interrupted");
+            EventMsg::CollabAgentSpawnBegin(CollabAgentSpawnBeginEvent {
+                call_id,
+                sender_thread_id: _,
+                prompt,
+            }) => {
+                ts_msg!(
+                    self,
+                    "{} {}",
+                    "collab".style(self.magenta),
+                    format_collab_invocation("spawn_agent", &call_id, Some(&prompt))
+                        .style(self.bold)
+                );
+            }
+            EventMsg::CollabAgentSpawnEnd(CollabAgentSpawnEndEvent {
+                call_id,
+                sender_thread_id: _,
+                new_thread_id,
+                prompt,
+                status,
+                ..
+            }) => {
+                let success = new_thread_id.is_some() && !is_collab_status_failure(&status);
+                let title_style = if success { self.green } else { self.red };
+                let title = format!(
+                    "{} {}:",
+                    format_collab_invocation("spawn_agent", &call_id, Some(&prompt)),
+                    format_collab_status(&status)
+                );
+                ts_msg!(self, "{}", title.style(title_style));
+                if let Some(new_thread_id) = new_thread_id {
+                    eprintln!("  agent: {}", new_thread_id.to_string().style(self.dimmed));
                 }
-                TurnAbortReason::Replaced => {
-                    ts_println!(self, "task aborted: replaced by a new task");
+            }
+            EventMsg::CollabAgentInteractionBegin(CollabAgentInteractionBeginEvent {
+                call_id,
+                sender_thread_id: _,
+                receiver_thread_id,
+                prompt,
+            }) => {
+                ts_msg!(
+                    self,
+                    "{} {}",
+                    "collab".style(self.magenta),
+                    format_collab_invocation("send_input", &call_id, Some(&prompt))
+                        .style(self.bold)
+                );
+                eprintln!(
+                    "  receiver: {}",
+                    receiver_thread_id.to_string().style(self.dimmed)
+                );
+            }
+            EventMsg::CollabAgentInteractionEnd(CollabAgentInteractionEndEvent {
+                call_id,
+                sender_thread_id: _,
+                receiver_thread_id,
+                prompt,
+                status,
+                ..
+            }) => {
+                let success = !is_collab_status_failure(&status);
+                let title_style = if success { self.green } else { self.red };
+                let title = format!(
+                    "{} {}:",
+                    format_collab_invocation("send_input", &call_id, Some(&prompt)),
+                    format_collab_status(&status)
+                );
+                ts_msg!(self, "{}", title.style(title_style));
+                eprintln!(
+                    "  receiver: {}",
+                    receiver_thread_id.to_string().style(self.dimmed)
+                );
+            }
+            EventMsg::CollabWaitingBegin(CollabWaitingBeginEvent {
+                sender_thread_id: _,
+                receiver_thread_ids,
+                call_id,
+                ..
+            }) => {
+                ts_msg!(
+                    self,
+                    "{} {}",
+                    "collab".style(self.magenta),
+                    format_collab_invocation("wait", &call_id, None).style(self.bold)
+                );
+                eprintln!(
+                    "  receivers: {}",
+                    format_receiver_list(&receiver_thread_ids).style(self.dimmed)
+                );
+            }
+            EventMsg::CollabWaitingEnd(CollabWaitingEndEvent {
+                sender_thread_id: _,
+                call_id,
+                statuses,
+                ..
+            }) => {
+                if statuses.is_empty() {
+                    ts_msg!(
+                        self,
+                        "{} {}:",
+                        format_collab_invocation("wait", &call_id, None),
+                        "timed out".style(self.yellow)
+                    );
+                    return CodexStatus::Running;
                 }
-                TurnAbortReason::ReviewEnded => {
-                    ts_println!(self, "task aborted: review ended");
+                let success = !statuses.values().any(is_collab_status_failure);
+                let title_style = if success { self.green } else { self.red };
+                let title = format!(
+                    "{} {} agents complete:",
+                    format_collab_invocation("wait", &call_id, None),
+                    statuses.len()
+                );
+                ts_msg!(self, "{}", title.style(title_style));
+                let mut sorted = statuses
+                    .into_iter()
+                    .map(|(thread_id, status)| (thread_id.to_string(), status))
+                    .collect::<Vec<_>>();
+                sorted.sort_by(|(left, _), (right, _)| left.cmp(right));
+                for (thread_id, status) in sorted {
+                    eprintln!(
+                        "  {} {}",
+                        thread_id.style(self.dimmed),
+                        format_collab_status(&status).style(style_for_agent_status(&status, self))
+                    );
                 }
-            },
+            }
+            EventMsg::CollabCloseBegin(CollabCloseBeginEvent {
+                call_id,
+                sender_thread_id: _,
+                receiver_thread_id,
+            }) => {
+                ts_msg!(
+                    self,
+                    "{} {}",
+                    "collab".style(self.magenta),
+                    format_collab_invocation("close_agent", &call_id, None).style(self.bold)
+                );
+                eprintln!(
+                    "  receiver: {}",
+                    receiver_thread_id.to_string().style(self.dimmed)
+                );
+            }
+            EventMsg::CollabCloseEnd(CollabCloseEndEvent {
+                call_id,
+                sender_thread_id: _,
+                receiver_thread_id,
+                status,
+                ..
+            }) => {
+                let success = !is_collab_status_failure(&status);
+                let title_style = if success { self.green } else { self.red };
+                let title = format!(
+                    "{} {}:",
+                    format_collab_invocation("close_agent", &call_id, None),
+                    format_collab_status(&status)
+                );
+                ts_msg!(self, "{}", title.style(title_style));
+                eprintln!(
+                    "  receiver: {}",
+                    receiver_thread_id.to_string().style(self.dimmed)
+                );
+            }
             EventMsg::ShutdownComplete => return CodexStatus::Shutdown,
-            EventMsg::ConversationPath(_) => {}
-            EventMsg::UserMessage(_) => {}
-            EventMsg::EnteredReviewMode(_) => {}
-            EventMsg::ExitedReviewMode(_) => {}
+            EventMsg::ThreadNameUpdated(_)
+            | EventMsg::ExecApprovalRequest(_)
+            | EventMsg::ApplyPatchApprovalRequest(_)
+            | EventMsg::TerminalInteraction(_)
+            | EventMsg::ExecCommandOutputDelta(_)
+            | EventMsg::GetHistoryEntryResponse(_)
+            | EventMsg::McpListToolsResponse(_)
+            | EventMsg::ListCustomPromptsResponse(_)
+            | EventMsg::ListSkillsResponse(_)
+            | EventMsg::ListRemoteSkillsResponse(_)
+            | EventMsg::RemoteSkillDownloaded(_)
+            | EventMsg::RawResponseItem(_)
+            | EventMsg::UserMessage(_)
+            | EventMsg::EnteredReviewMode(_)
+            | EventMsg::ExitedReviewMode(_)
+            | EventMsg::AgentMessageDelta(_)
+            | EventMsg::AgentReasoningDelta(_)
+            | EventMsg::AgentReasoningRawContentDelta(_)
+            | EventMsg::ItemStarted(_)
+            | EventMsg::ItemCompleted(_)
+            | EventMsg::AgentMessageContentDelta(_)
+            | EventMsg::PlanDelta(_)
+            | EventMsg::ReasoningContentDelta(_)
+            | EventMsg::ReasoningRawContentDelta(_)
+            | EventMsg::SkillsUpdateAvailable
+            | EventMsg::UndoCompleted(_)
+            | EventMsg::UndoStarted(_)
+            | EventMsg::ThreadRolledBack(_)
+            | EventMsg::RequestUserInput(_)
+            | EventMsg::CollabResumeBegin(_)
+            | EventMsg::CollabResumeEnd(_)
+            | EventMsg::RealtimeConversationStarted(_)
+            | EventMsg::RealtimeConversationRealtime(_)
+            | EventMsg::RealtimeConversationClosed(_)
+            | EventMsg::DynamicToolCallRequest(_) => {}
         }
         CodexStatus::Running
+    }
+
+    fn print_final_output(&mut self) {
+        if let Some(usage_info) = &self.last_total_token_usage {
+            eprintln!(
+                "{}\n{}",
+                "tokens used".style(self.magenta).style(self.italic),
+                format_with_separators(usage_info.total_token_usage.blended_total())
+            );
+        }
+
+        // If the user has not piped the final message to a file, they will see
+        // it twice: once written to stderr as part of the normal event
+        // processing, and once here on stdout. We print the token summary above
+        // to help break up the output visually in that case.
+        #[allow(clippy::print_stdout)]
+        if let Some(message) = &self.final_message {
+            if message.ends_with('\n') {
+                print!("{message}");
+            } else {
+                println!("{message}");
+            }
+        }
     }
 }
 
@@ -616,6 +855,78 @@ fn format_file_change(change: &FileChange) -> &'static str {
             move_path: None, ..
         } => "M",
     }
+}
+
+fn format_collab_invocation(tool: &str, call_id: &str, prompt: Option<&str>) -> String {
+    let prompt = prompt
+        .map(str::trim)
+        .filter(|prompt| !prompt.is_empty())
+        .map(|prompt| truncate_preview(prompt, 120));
+    match prompt {
+        Some(prompt) => format!("{tool}({call_id}, prompt=\"{prompt}\")"),
+        None => format!("{tool}({call_id})"),
+    }
+}
+
+fn format_collab_status(status: &AgentStatus) -> String {
+    match status {
+        AgentStatus::PendingInit => "pending init".to_string(),
+        AgentStatus::Running => "running".to_string(),
+        AgentStatus::Completed(Some(message)) => {
+            let preview = truncate_preview(message.trim(), 120);
+            if preview.is_empty() {
+                "completed".to_string()
+            } else {
+                format!("completed: \"{preview}\"")
+            }
+        }
+        AgentStatus::Completed(None) => "completed".to_string(),
+        AgentStatus::Errored(message) => {
+            let preview = truncate_preview(message.trim(), 120);
+            if preview.is_empty() {
+                "errored".to_string()
+            } else {
+                format!("errored: \"{preview}\"")
+            }
+        }
+        AgentStatus::Shutdown => "shutdown".to_string(),
+        AgentStatus::NotFound => "not found".to_string(),
+    }
+}
+
+fn style_for_agent_status(
+    status: &AgentStatus,
+    processor: &EventProcessorWithHumanOutput,
+) -> Style {
+    match status {
+        AgentStatus::PendingInit | AgentStatus::Shutdown => processor.dimmed,
+        AgentStatus::Running => processor.cyan,
+        AgentStatus::Completed(_) => processor.green,
+        AgentStatus::Errored(_) | AgentStatus::NotFound => processor.red,
+    }
+}
+
+fn is_collab_status_failure(status: &AgentStatus) -> bool {
+    matches!(status, AgentStatus::Errored(_) | AgentStatus::NotFound)
+}
+
+fn format_receiver_list(ids: &[codex_protocol::ThreadId]) -> String {
+    if ids.is_empty() {
+        return "none".to_string();
+    }
+    ids.iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn truncate_preview(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+
+    let preview = text.chars().take(max_chars).collect::<String>();
+    format!("{preview}…")
 }
 
 fn format_mcp_invocation(invocation: &McpInvocation) -> String {

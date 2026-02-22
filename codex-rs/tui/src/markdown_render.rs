@@ -1,4 +1,7 @@
-use crate::citation_regex::CITATION_REGEX;
+use crate::render::highlight::highlight_code_to_lines;
+use crate::render::line_utils::line_to_static;
+use crate::wrapping::RtOptions;
+use crate::wrapping::adaptive_wrap_line;
 use pulldown_cmark::CodeBlockKind;
 use pulldown_cmark::CowStr;
 use pulldown_cmark::Event;
@@ -8,12 +11,49 @@ use pulldown_cmark::Parser;
 use pulldown_cmark::Tag;
 use pulldown_cmark::TagEnd;
 use ratatui::style::Style;
-use ratatui::style::Stylize;
 use ratatui::text::Line;
 use ratatui::text::Span;
 use ratatui::text::Text;
-use std::borrow::Cow;
-use std::path::Path;
+
+struct MarkdownStyles {
+    h1: Style,
+    h2: Style,
+    h3: Style,
+    h4: Style,
+    h5: Style,
+    h6: Style,
+    code: Style,
+    emphasis: Style,
+    strong: Style,
+    strikethrough: Style,
+    ordered_list_marker: Style,
+    unordered_list_marker: Style,
+    link: Style,
+    blockquote: Style,
+}
+
+impl Default for MarkdownStyles {
+    fn default() -> Self {
+        use ratatui::style::Stylize;
+
+        Self {
+            h1: Style::new().bold().underlined(),
+            h2: Style::new().bold(),
+            h3: Style::new().bold().italic(),
+            h4: Style::new().italic(),
+            h5: Style::new().italic(),
+            h6: Style::new().italic(),
+            code: Style::new().cyan(),
+            emphasis: Style::new().italic(),
+            strong: Style::new().bold(),
+            strikethrough: Style::new().crossed_out(),
+            ordered_list_marker: Style::new().light_blue(),
+            unordered_list_marker: Style::new(),
+            link: Style::new().cyan().underlined(),
+            blockquote: Style::new().green(),
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 struct IndentContext {
@@ -32,25 +72,15 @@ impl IndentContext {
     }
 }
 
-#[allow(dead_code)]
-pub(crate) fn render_markdown_text(input: &str) -> Text<'static> {
-    let mut options = Options::empty();
-    options.insert(Options::ENABLE_STRIKETHROUGH);
-    let parser = Parser::new_ext(input, options);
-    let mut w = Writer::new(parser, None, None);
-    w.run();
-    w.text
+pub fn render_markdown_text(input: &str) -> Text<'static> {
+    render_markdown_text_with_width(input, None)
 }
 
-pub(crate) fn render_markdown_text_with_citations(
-    input: &str,
-    scheme: Option<&str>,
-    cwd: &Path,
-) -> Text<'static> {
+pub(crate) fn render_markdown_text_with_width(input: &str, width: Option<usize>) -> Text<'static> {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_STRIKETHROUGH);
     let parser = Parser::new_ext(input, options);
-    let mut w = Writer::new(parser, scheme.map(str::to_string), Some(cwd.to_path_buf()));
+    let mut w = Writer::new(parser, width);
     w.run();
     w.text
 }
@@ -61,6 +91,7 @@ where
 {
     iter: I,
     text: Text<'static>,
+    styles: MarkdownStyles,
     inline_styles: Vec<Style>,
     indent_stack: Vec<IndentContext>,
     list_indices: Vec<Option<u64>>,
@@ -68,19 +99,26 @@ where
     needs_newline: bool,
     pending_marker_line: bool,
     in_paragraph: bool,
-    scheme: Option<String>,
-    cwd: Option<std::path::PathBuf>,
     in_code_block: bool,
+    code_block_lang: Option<String>,
+    code_block_buffer: String,
+    wrap_width: Option<usize>,
+    current_line_content: Option<Line<'static>>,
+    current_initial_indent: Vec<Span<'static>>,
+    current_subsequent_indent: Vec<Span<'static>>,
+    current_line_style: Style,
+    current_line_in_code_block: bool,
 }
 
 impl<'a, I> Writer<'a, I>
 where
     I: Iterator<Item = Event<'a>>,
 {
-    fn new(iter: I, scheme: Option<String>, cwd: Option<std::path::PathBuf>) -> Self {
+    fn new(iter: I, wrap_width: Option<usize>) -> Self {
         Self {
             iter,
             text: Text::default(),
+            styles: MarkdownStyles::default(),
             inline_styles: Vec::new(),
             indent_stack: Vec::new(),
             list_indices: Vec::new(),
@@ -88,9 +126,15 @@ where
             needs_newline: false,
             pending_marker_line: false,
             in_paragraph: false,
-            scheme,
-            cwd,
             in_code_block: false,
+            code_block_lang: None,
+            code_block_buffer: String::new(),
+            wrap_width,
+            current_line_content: None,
+            current_initial_indent: Vec::new(),
+            current_subsequent_indent: Vec::new(),
+            current_line_style: Style::default(),
+            current_line_in_code_block: false,
         }
     }
 
@@ -98,6 +142,7 @@ where
         while let Some(ev) = self.iter.next() {
             self.handle_event(ev);
         }
+        self.flush_current_line();
     }
 
     fn handle_event(&mut self, event: Event<'a>) {
@@ -109,6 +154,7 @@ where
             Event::SoftBreak => self.soft_break(),
             Event::HardBreak => self.hard_break(),
             Event::Rule => {
+                self.flush_current_line();
                 if !self.text.lines.is_empty() {
                     self.push_blank_line();
                 }
@@ -140,9 +186,9 @@ where
             }
             Tag::List(start) => self.start_list(start),
             Tag::Item => self.start_item(),
-            Tag::Emphasis => self.push_inline_style(Style::new().italic()),
-            Tag::Strong => self.push_inline_style(Style::new().bold()),
-            Tag::Strikethrough => self.push_inline_style(Style::new().crossed_out()),
+            Tag::Emphasis => self.push_inline_style(self.styles.emphasis),
+            Tag::Strong => self.push_inline_style(self.styles.strong),
+            Tag::Strikethrough => self.push_inline_style(self.styles.strikethrough),
             Tag::Link { dest_url, .. } => self.push_link(dest_url.to_string()),
             Tag::HtmlBlock
             | Tag::FootnoteDefinition(_)
@@ -200,12 +246,12 @@ where
             self.needs_newline = false;
         }
         let heading_style = match level {
-            HeadingLevel::H1 => Style::new().bold().underlined(),
-            HeadingLevel::H2 => Style::new().bold(),
-            HeadingLevel::H3 => Style::new().bold().italic(),
-            HeadingLevel::H4 => Style::new().italic(),
-            HeadingLevel::H5 => Style::new().italic(),
-            HeadingLevel::H6 => Style::new().italic(),
+            HeadingLevel::H1 => self.styles.h1,
+            HeadingLevel::H2 => self.styles.h2,
+            HeadingLevel::H3 => self.styles.h3,
+            HeadingLevel::H4 => self.styles.h4,
+            HeadingLevel::H5 => self.styles.h5,
+            HeadingLevel::H6 => self.styles.h6,
         };
         let content = format!("{} ", "#".repeat(level as usize));
         self.push_line(Line::from(vec![Span::styled(content, heading_style)]));
@@ -237,16 +283,31 @@ where
             self.push_line(Line::default());
         }
         self.pending_marker_line = false;
-        if self.in_code_block
-            && !self.needs_newline
-            && self
-                .text
-                .lines
-                .last()
+
+        // When inside a fenced code block with a known language, accumulate
+        // text into the buffer for batch highlighting in end_codeblock().
+        // Append verbatim — pulldown-cmark text events already contain the
+        // original line breaks, so inserting separators would double them.
+        if self.in_code_block && self.code_block_lang.is_some() {
+            self.code_block_buffer.push_str(&text);
+            return;
+        }
+
+        if self.in_code_block && !self.needs_newline {
+            let has_content = self
+                .current_line_content
+                .as_ref()
                 .map(|line| !line.spans.is_empty())
-                .unwrap_or(false)
-        {
-            self.push_line(Line::default());
+                .unwrap_or_else(|| {
+                    self.text
+                        .lines
+                        .last()
+                        .map(|line| !line.spans.is_empty())
+                        .unwrap_or(false)
+                });
+            if has_content {
+                self.push_line(Line::default());
+            }
         }
         for (i, line) in text.lines().enumerate() {
             if self.needs_newline {
@@ -256,15 +317,7 @@ where
             if i > 0 {
                 self.push_line(Line::default());
             }
-            let mut content = line.to_string();
-            if !self.in_code_block
-                && let (Some(scheme), Some(cwd)) = (&self.scheme, &self.cwd)
-            {
-                let cow = rewrite_file_citations_with_scheme(&content, Some(scheme.as_str()), cwd);
-                if let std::borrow::Cow::Owned(s) = cow {
-                    content = s;
-                }
-            }
+            let content = line.to_string();
             let span = Span::styled(
                 content,
                 self.inline_styles.last().copied().unwrap_or_default(),
@@ -279,7 +332,7 @@ where
             self.push_line(Line::default());
             self.pending_marker_line = false;
         }
-        let span = Span::from(code.into_string()).dim();
+        let span = Span::from(code.into_string()).style(self.styles.code);
         self.push_span(span);
     }
 
@@ -330,10 +383,16 @@ where
         let width = depth * 4 - 3;
         let marker = if let Some(last_index) = self.list_indices.last_mut() {
             match last_index {
-                None => Some(vec![Span::from(" ".repeat(width - 1) + "- ")]),
+                None => Some(vec![Span::styled(
+                    " ".repeat(width - 1) + "- ",
+                    self.styles.unordered_list_marker,
+                )]),
                 Some(index) => {
                     *index += 1;
-                    Some(vec![format!("{:width$}. ", *index - 1).light_blue()])
+                    Some(vec![Span::styled(
+                        format!("{:width$}. ", *index - 1),
+                        self.styles.ordered_list_marker,
+                    )])
                 }
             }
         } else {
@@ -350,26 +409,48 @@ where
         self.needs_newline = false;
     }
 
-    fn start_codeblock(&mut self, _lang: Option<String>, indent: Option<Span<'static>>) {
+    fn start_codeblock(&mut self, lang: Option<String>, indent: Option<Span<'static>>) {
+        self.flush_current_line();
         if !self.text.lines.is_empty() {
             self.push_blank_line();
         }
         self.in_code_block = true;
+
+        // Extract the language token from the info string.  CommonMark info
+        // strings can contain metadata after the language, separated by commas,
+        // spaces, or other delimiters (e.g. "rust,no_run", "rust title=demo").
+        // Take only the first token so the syntax lookup succeeds.
+        let lang = lang
+            .as_deref()
+            .and_then(|s| s.split([',', ' ', '\t']).next())
+            .filter(|s| !s.is_empty())
+            .map(std::string::ToString::to_string);
+        self.code_block_lang = lang;
+        self.code_block_buffer.clear();
+
         self.indent_stack.push(IndentContext::new(
             vec![indent.unwrap_or_default()],
             None,
             false,
         ));
-        // let opener = match lang {
-        //     Some(l) if !l.is_empty() => format!("```{l}"),
-        //     _ => "```".to_string(),
-        // };
-        // self.push_line(opener.into());
         self.needs_newline = true;
     }
 
     fn end_codeblock(&mut self) {
-        // self.push_line("```".into());
+        // If we buffered code for a known language, syntax-highlight it now.
+        if let Some(lang) = self.code_block_lang.take() {
+            let code = std::mem::take(&mut self.code_block_buffer);
+            if !code.is_empty() {
+                let highlighted = highlight_code_to_lines(&code, &lang);
+                for hl_line in highlighted {
+                    self.push_line(Line::default());
+                    for span in hl_line.spans {
+                        self.push_span(span);
+                    }
+                }
+            }
+        }
+
         self.needs_newline = true;
         self.in_code_block = false;
         self.indent_stack.pop();
@@ -392,50 +473,80 @@ where
     fn pop_link(&mut self) {
         if let Some(link) = self.link.take() {
             self.push_span(" (".into());
-            self.push_span(link.cyan().underlined());
+            self.push_span(Span::styled(link, self.styles.link));
             self.push_span(")".into());
         }
     }
 
+    fn flush_current_line(&mut self) {
+        if let Some(line) = self.current_line_content.take() {
+            let style = self.current_line_style;
+            // NB we don't wrap code in code blocks, in order to preserve whitespace for copy/paste.
+            if !self.current_line_in_code_block
+                && let Some(width) = self.wrap_width
+            {
+                let opts = RtOptions::new(width)
+                    .initial_indent(self.current_initial_indent.clone().into())
+                    .subsequent_indent(self.current_subsequent_indent.clone().into());
+                for wrapped in adaptive_wrap_line(&line, opts) {
+                    let owned = line_to_static(&wrapped).style(style);
+                    self.text.lines.push(owned);
+                }
+            } else {
+                let mut spans = self.current_initial_indent.clone();
+                let mut line = line;
+                spans.append(&mut line.spans);
+                self.text.lines.push(Line::from_iter(spans).style(style));
+            }
+            self.current_initial_indent.clear();
+            self.current_subsequent_indent.clear();
+            self.current_line_in_code_block = false;
+        }
+    }
+
     fn push_line(&mut self, line: Line<'static>) {
-        let mut line = line;
-        let was_pending = self.pending_marker_line;
-        let mut spans = self.current_prefix_spans();
-        spans.append(&mut line.spans);
+        self.flush_current_line();
         let blockquote_active = self
             .indent_stack
             .iter()
             .any(|ctx| ctx.prefix.iter().any(|s| s.content.contains('>')));
         let style = if blockquote_active {
-            Style::new().green()
+            self.styles.blockquote
         } else {
             line.style
         };
-        self.text.lines.push(Line::from_iter(spans).style(style));
-        if was_pending {
-            self.pending_marker_line = false;
-        }
+        let was_pending = self.pending_marker_line;
+
+        self.current_initial_indent = self.prefix_spans(was_pending);
+        self.current_subsequent_indent = self.prefix_spans(false);
+        self.current_line_style = style;
+        self.current_line_content = Some(line);
+        self.current_line_in_code_block = self.in_code_block;
+
+        self.pending_marker_line = false;
     }
 
     fn push_span(&mut self, span: Span<'static>) {
-        if let Some(last) = self.text.lines.last_mut() {
-            last.push_span(span);
+        if let Some(line) = self.current_line_content.as_mut() {
+            line.push_span(span);
         } else {
             self.push_line(Line::from(vec![span]));
         }
     }
 
     fn push_blank_line(&mut self) {
+        self.flush_current_line();
         if self.indent_stack.iter().all(|ctx| ctx.is_list) {
             self.text.lines.push(Line::default());
         } else {
             self.push_line(Line::default());
+            self.flush_current_line();
         }
     }
 
-    fn current_prefix_spans(&self) -> Vec<Span<'static>> {
+    fn prefix_spans(&self, pending_marker_line: bool) -> Vec<Span<'static>> {
         let mut prefix: Vec<Span<'static>> = Vec::new();
-        let last_marker_index = if self.pending_marker_line {
+        let last_marker_index = if pending_marker_line {
             self.indent_stack
                 .iter()
                 .enumerate()
@@ -447,7 +558,7 @@ where
         let last_list_index = self.indent_stack.iter().rposition(|ctx| ctx.is_list);
 
         for (i, ctx) in self.indent_stack.iter().enumerate() {
-            if self.pending_marker_line {
+            if pending_marker_line {
                 if Some(i) == last_marker_index
                     && let Some(marker) = &ctx.marker
                 {
@@ -467,44 +578,6 @@ where
     }
 }
 
-pub(crate) fn rewrite_file_citations_with_scheme<'a>(
-    src: &'a str,
-    scheme_opt: Option<&str>,
-    cwd: &Path,
-) -> Cow<'a, str> {
-    let scheme: &str = match scheme_opt {
-        Some(s) => s,
-        None => return Cow::Borrowed(src),
-    };
-
-    CITATION_REGEX.replace_all(src, |caps: &regex_lite::Captures<'_>| {
-        let file = &caps[1];
-        let start_line = &caps[2];
-
-        // Resolve the path against `cwd` when it is relative.
-        let absolute_path = {
-            let p = Path::new(file);
-            let absolute_path = if p.is_absolute() {
-                path_clean::clean(p)
-            } else {
-                path_clean::clean(cwd.join(p))
-            };
-            // VS Code expects forward slashes even on Windows because URIs use
-            // `/` as the path separator.
-            absolute_path.to_string_lossy().replace('\\', "/")
-        };
-
-        // Render as a normal markdown link so the downstream renderer emits
-        // the hyperlink escape sequence (when supported by the terminal).
-        //
-        // In practice, sometimes multiple citations for the same file, but with a
-        // different line number, are shown sequentially, so we:
-        // - include the line number in the label to disambiguate them
-        // - add a space after the link to make it easier to read
-        format!("[{file}:{start_line}]({scheme}://file{absolute_path}:{start_line}) ")
-    })
-}
-
 #[cfg(test)]
 mod markdown_render_tests {
     include!("markdown_render_tests.rs");
@@ -514,49 +587,183 @@ mod markdown_render_tests {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+    use ratatui::text::Text;
 
-    #[test]
-    fn citation_is_rewritten_with_absolute_path() {
-        let markdown = "See 【F:/src/main.rs†L42-L50】 for details.";
-        let cwd = Path::new("/workspace");
-        let result = rewrite_file_citations_with_scheme(markdown, Some("vscode"), cwd);
-
-        assert_eq!(
-            "See [/src/main.rs:42](vscode://file/src/main.rs:42)  for details.",
-            result
-        );
-    }
-
-    #[test]
-    fn citation_followed_by_space_so_they_do_not_run_together() {
-        let markdown = "References on lines 【F:src/foo.rs†L24】【F:src/foo.rs†L42】";
-        let cwd = Path::new("/home/user/project");
-        let result = rewrite_file_citations_with_scheme(markdown, Some("vscode"), cwd);
-
-        assert_eq!(
-            "References on lines [src/foo.rs:24](vscode://file/home/user/project/src/foo.rs:24) [src/foo.rs:42](vscode://file/home/user/project/src/foo.rs:42) ",
-            result
-        );
-    }
-
-    #[test]
-    fn citation_unchanged_without_file_opener() {
-        let markdown = "Look at 【F:file.rs†L1】.";
-        let cwd = Path::new("/");
-        let unchanged = rewrite_file_citations_with_scheme(markdown, Some("vscode"), cwd);
-        // The helper itself always rewrites – this test validates behaviour of
-        // append_markdown when `file_opener` is None.
-        let rendered = render_markdown_text_with_citations(markdown, None, cwd);
-        // Convert lines back to string for comparison.
-        let rendered: String = rendered
-            .lines
+    fn lines_to_strings(text: &Text<'_>) -> Vec<String> {
+        text.lines
             .iter()
-            .flat_map(|l| l.spans.iter())
-            .map(|s| s.content.clone())
-            .collect::<Vec<_>>()
-            .join("");
-        assert_eq!(markdown, rendered);
-        // Ensure helper rewrites.
-        assert_ne!(markdown, unchanged);
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.clone())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn wraps_plain_text_when_width_provided() {
+        let markdown = "This is a simple sentence that should wrap.";
+        let rendered = render_markdown_text_with_width(markdown, Some(16));
+        let lines = lines_to_strings(&rendered);
+        assert_eq!(
+            lines,
+            vec![
+                "This is a simple".to_string(),
+                "sentence that".to_string(),
+                "should wrap.".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn wraps_list_items_preserving_indent() {
+        let markdown = "- first second third fourth";
+        let rendered = render_markdown_text_with_width(markdown, Some(14));
+        let lines = lines_to_strings(&rendered);
+        assert_eq!(
+            lines,
+            vec!["- first second".to_string(), "  third fourth".to_string(),]
+        );
+    }
+
+    #[test]
+    fn wraps_nested_lists() {
+        let markdown =
+            "- outer item with several words to wrap\n  - inner item that also needs wrapping";
+        let rendered = render_markdown_text_with_width(markdown, Some(20));
+        let lines = lines_to_strings(&rendered);
+        assert_eq!(
+            lines,
+            vec![
+                "- outer item with".to_string(),
+                "  several words to".to_string(),
+                "  wrap".to_string(),
+                "    - inner item".to_string(),
+                "      that also".to_string(),
+                "      needs wrapping".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn wraps_ordered_lists() {
+        let markdown = "1. ordered item contains many words for wrapping";
+        let rendered = render_markdown_text_with_width(markdown, Some(18));
+        let lines = lines_to_strings(&rendered);
+        assert_eq!(
+            lines,
+            vec![
+                "1. ordered item".to_string(),
+                "   contains many".to_string(),
+                "   words for".to_string(),
+                "   wrapping".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn wraps_blockquotes() {
+        let markdown = "> block quote with content that should wrap nicely";
+        let rendered = render_markdown_text_with_width(markdown, Some(22));
+        let lines = lines_to_strings(&rendered);
+        assert_eq!(
+            lines,
+            vec![
+                "> block quote with".to_string(),
+                "> content that should".to_string(),
+                "> wrap nicely".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn wraps_blockquotes_inside_lists() {
+        let markdown = "- list item\n  > block quote inside list that wraps";
+        let rendered = render_markdown_text_with_width(markdown, Some(24));
+        let lines = lines_to_strings(&rendered);
+        assert_eq!(
+            lines,
+            vec![
+                "- list item".to_string(),
+                "  > block quote inside".to_string(),
+                "  > list that wraps".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn wraps_list_items_containing_blockquotes() {
+        let markdown = "1. item with quote\n   > quoted text that should wrap";
+        let rendered = render_markdown_text_with_width(markdown, Some(24));
+        let lines = lines_to_strings(&rendered);
+        assert_eq!(
+            lines,
+            vec![
+                "1. item with quote".to_string(),
+                "   > quoted text that".to_string(),
+                "   > should wrap".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn does_not_wrap_code_blocks() {
+        let markdown = "````\nfn main() { println!(\"hi from a long line\"); }\n````";
+        let rendered = render_markdown_text_with_width(markdown, Some(10));
+        let lines = lines_to_strings(&rendered);
+        assert_eq!(
+            lines,
+            vec!["fn main() { println!(\"hi from a long line\"); }".to_string(),]
+        );
+    }
+
+    #[test]
+    fn does_not_split_long_url_like_token_without_scheme() {
+        let url_like =
+            "example.test/api/v1/projects/alpha-team/releases/2026-02-17/builds/1234567890";
+        let rendered = render_markdown_text_with_width(url_like, Some(24));
+        let lines = lines_to_strings(&rendered);
+
+        assert_eq!(
+            lines.iter().filter(|line| line.contains(url_like)).count(),
+            1,
+            "expected full URL-like token in one rendered line, got: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn fenced_code_info_string_with_metadata_highlights() {
+        // CommonMark info strings like "rust,no_run" or "rust title=demo"
+        // contain metadata after the language token.  The language must be
+        // extracted (first word / comma-separated token) so highlighting works.
+        for info in &["rust,no_run", "rust no_run", "rust title=\"demo\""] {
+            let markdown = format!("```{info}\nfn main() {{}}\n```\n");
+            let rendered = render_markdown_text(&markdown);
+            let has_rgb = rendered.lines.iter().any(|line| {
+                line.spans
+                    .iter()
+                    .any(|s| matches!(s.style.fg, Some(ratatui::style::Color::Rgb(..))))
+            });
+            assert!(
+                has_rgb,
+                "info string \"{info}\" should still produce syntax highlighting"
+            );
+        }
+    }
+
+    #[test]
+    fn crlf_code_block_no_extra_blank_lines() {
+        // pulldown-cmark can split CRLF code blocks into multiple Text events.
+        // The buffer must concatenate them verbatim — no inserted separators.
+        let markdown = "```rust\r\nfn main() {}\r\n    line2\r\n```\r\n";
+        let rendered = render_markdown_text(markdown);
+        let lines = lines_to_strings(&rendered);
+        // Should be exactly two code lines; no spurious blank line between them.
+        assert_eq!(
+            lines,
+            vec!["fn main() {}".to_string(), "    line2".to_string()],
+            "CRLF code block should not produce extra blank lines: {lines:?}"
+        );
     }
 }

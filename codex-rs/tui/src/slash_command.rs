@@ -14,39 +14,91 @@ pub enum SlashCommand {
     // more frequently used commands should be listed first.
     Model,
     Approvals,
+    Permissions,
+    #[strum(serialize = "setup-default-sandbox")]
+    ElevateSandbox,
+    #[strum(serialize = "sandbox-add-read-dir")]
+    SandboxReadRoot,
+    Experimental,
+    Skills,
     Review,
+    Rename,
     New,
+    Resume,
+    Fork,
     Init,
     Compact,
-    Undo,
+    Plan,
+    Collab,
+    Agent,
+    // Undo,
     Diff,
     Mention,
     Status,
+    DebugConfig,
+    Statusline,
+    Theme,
     Mcp,
+    Apps,
     Logout,
     Quit,
-    #[cfg(debug_assertions)]
+    Exit,
+    Feedback,
+    Rollout,
+    Ps,
+    Clean,
+    Clear,
+    Personality,
     TestApproval,
+    // Debugging commands.
+    #[strum(serialize = "debug-m-drop")]
+    MemoryDrop,
+    #[strum(serialize = "debug-m-update")]
+    MemoryUpdate,
 }
 
 impl SlashCommand {
     /// User-visible description shown in the popup.
     pub fn description(self) -> &'static str {
         match self {
+            SlashCommand::Feedback => "send logs to maintainers",
             SlashCommand::New => "start a new chat during a conversation",
             SlashCommand::Init => "create an AGENTS.md file with instructions for Codex",
             SlashCommand::Compact => "summarize conversation to prevent hitting the context limit",
             SlashCommand::Review => "review my current changes and find issues",
-            SlashCommand::Undo => "restore the workspace to the last Codex snapshot",
-            SlashCommand::Quit => "exit Codex",
+            SlashCommand::Rename => "rename the current thread",
+            SlashCommand::Resume => "resume a saved chat",
+            SlashCommand::Clear => "clear the terminal screen and scrollback",
+            SlashCommand::Fork => "fork the current chat",
+            // SlashCommand::Undo => "ask Codex to undo a turn",
+            SlashCommand::Quit | SlashCommand::Exit => "exit Codex",
             SlashCommand::Diff => "show git diff (including untracked files)",
             SlashCommand::Mention => "mention a file",
+            SlashCommand::Skills => "use skills to improve how Codex performs specific tasks",
             SlashCommand::Status => "show current session configuration and token usage",
+            SlashCommand::DebugConfig => "show config layers and requirement sources for debugging",
+            SlashCommand::Statusline => "configure which items appear in the status line",
+            SlashCommand::Theme => "choose a syntax highlighting theme",
+            SlashCommand::Ps => "list background terminals",
+            SlashCommand::Clean => "stop all background terminals",
+            SlashCommand::MemoryDrop => "DO NOT USE",
+            SlashCommand::MemoryUpdate => "DO NOT USE",
             SlashCommand::Model => "choose what model and reasoning effort to use",
-            SlashCommand::Approvals => "choose what Codex can do without approval",
+            SlashCommand::Personality => "choose a communication style for Codex",
+            SlashCommand::Plan => "switch to Plan mode",
+            SlashCommand::Collab => "change collaboration mode (experimental)",
+            SlashCommand::Agent => "switch the active agent thread",
+            SlashCommand::Approvals => "choose what Codex is allowed to do",
+            SlashCommand::Permissions => "choose what Codex is allowed to do",
+            SlashCommand::ElevateSandbox => "set up elevated agent sandbox",
+            SlashCommand::SandboxReadRoot => {
+                "let sandbox read a directory: /sandbox-add-read-dir <absolute_path>"
+            }
+            SlashCommand::Experimental => "toggle experimental features",
             SlashCommand::Mcp => "list configured MCP tools",
+            SlashCommand::Apps => "manage apps",
             SlashCommand::Logout => "log out of Codex",
-            #[cfg(debug_assertions)]
+            SlashCommand::Rollout => "print the rollout file path",
             SlashCommand::TestApproval => "test approval request",
         }
     }
@@ -57,45 +109,74 @@ impl SlashCommand {
         self.into()
     }
 
+    /// Whether this command supports inline args (for example `/review ...`).
+    pub fn supports_inline_args(self) -> bool {
+        matches!(
+            self,
+            SlashCommand::Review
+                | SlashCommand::Rename
+                | SlashCommand::Plan
+                | SlashCommand::SandboxReadRoot
+        )
+    }
+
     /// Whether this command can be run while a task is in progress.
     pub fn available_during_task(self) -> bool {
         match self {
             SlashCommand::New
+            | SlashCommand::Resume
+            | SlashCommand::Fork
             | SlashCommand::Init
             | SlashCommand::Compact
-            | SlashCommand::Undo
+            // | SlashCommand::Undo
             | SlashCommand::Model
+            | SlashCommand::Personality
             | SlashCommand::Approvals
+            | SlashCommand::Permissions
+            | SlashCommand::ElevateSandbox
+            | SlashCommand::SandboxReadRoot
+            | SlashCommand::Experimental
             | SlashCommand::Review
-            | SlashCommand::Logout => false,
+            | SlashCommand::Plan
+            | SlashCommand::Clear
+            | SlashCommand::Logout
+            | SlashCommand::MemoryDrop
+            | SlashCommand::MemoryUpdate => false,
             SlashCommand::Diff
+            | SlashCommand::Rename
             | SlashCommand::Mention
+            | SlashCommand::Skills
             | SlashCommand::Status
+            | SlashCommand::DebugConfig
+            | SlashCommand::Ps
+            | SlashCommand::Clean
             | SlashCommand::Mcp
-            | SlashCommand::Quit => true,
-
-            #[cfg(debug_assertions)]
+            | SlashCommand::Apps
+            | SlashCommand::Feedback
+            | SlashCommand::Quit
+            | SlashCommand::Exit => true,
+            SlashCommand::Rollout => true,
             SlashCommand::TestApproval => true,
+            SlashCommand::Collab => true,
+            SlashCommand::Agent => true,
+            SlashCommand::Statusline => false,
+            SlashCommand::Theme => false,
+        }
+    }
+
+    fn is_visible(self) -> bool {
+        match self {
+            SlashCommand::SandboxReadRoot => cfg!(target_os = "windows"),
+            SlashCommand::Rollout | SlashCommand::TestApproval => cfg!(debug_assertions),
+            _ => true,
         }
     }
 }
 
 /// Return all built-in commands in a Vec paired with their command string.
 pub fn built_in_slash_commands() -> Vec<(&'static str, SlashCommand)> {
-    let show_beta_features = beta_features_enabled();
-
     SlashCommand::iter()
-        .filter(|cmd| {
-            if *cmd == SlashCommand::Undo {
-                show_beta_features
-            } else {
-                true
-            }
-        })
+        .filter(|command| command.is_visible())
         .map(|c| (c.command(), c))
         .collect()
-}
-
-fn beta_features_enabled() -> bool {
-    std::env::var_os("BETA_FEATURE").is_some()
 }

@@ -2,6 +2,7 @@
 name = "codex-utils-readiness"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
@@ -10,6 +11,7 @@ time = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time"] }
 
 [dev-dependencies]
+assert_matches = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
 
 [lints]

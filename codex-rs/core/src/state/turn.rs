@@ -4,11 +4,16 @@ use indexmap::IndexMap;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tokio::task::AbortHandle;
+use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::AbortOnDropHandle;
 
+use codex_protocol::dynamic_tools::DynamicToolResponse;
 use codex_protocol::models::ResponseInputItem;
+use codex_protocol::request_user_input::RequestUserInputResponse;
 use tokio::sync::oneshot;
 
+use crate::codex::TurnContext;
 use crate::protocol::ReviewDecision;
 use crate::tasks::SessionTask;
 
@@ -34,15 +39,20 @@ pub(crate) enum TaskKind {
     Compact,
 }
 
-#[derive(Clone)]
 pub(crate) struct RunningTask {
-    pub(crate) handle: AbortHandle,
+    pub(crate) done: Arc<Notify>,
     pub(crate) kind: TaskKind,
     pub(crate) task: Arc<dyn SessionTask>,
+    pub(crate) cancellation_token: CancellationToken,
+    pub(crate) handle: Arc<AbortOnDropHandle<()>>,
+    pub(crate) turn_context: Arc<TurnContext>,
+    // Timer recorded when the task drops to capture the full turn duration.
+    pub(crate) _timer: Option<codex_otel::Timer>,
 }
 
 impl ActiveTurn {
-    pub(crate) fn add_task(&mut self, sub_id: String, task: RunningTask) {
+    pub(crate) fn add_task(&mut self, task: RunningTask) {
+        let sub_id = task.turn_context.sub_id.clone();
         self.tasks.insert(sub_id, task);
     }
 
@@ -51,8 +61,8 @@ impl ActiveTurn {
         self.tasks.is_empty()
     }
 
-    pub(crate) fn drain_tasks(&mut self) -> IndexMap<String, RunningTask> {
-        std::mem::take(&mut self.tasks)
+    pub(crate) fn drain_tasks(&mut self) -> Vec<RunningTask> {
+        self.tasks.drain(..).map(|(_, task)| task).collect()
     }
 }
 
@@ -60,6 +70,8 @@ impl ActiveTurn {
 #[derive(Default)]
 pub(crate) struct TurnState {
     pending_approvals: HashMap<String, oneshot::Sender<ReviewDecision>>,
+    pending_user_input: HashMap<String, oneshot::Sender<RequestUserInputResponse>>,
+    pending_dynamic_tools: HashMap<String, oneshot::Sender<DynamicToolResponse>>,
     pending_input: Vec<ResponseInputItem>,
 }
 
@@ -81,7 +93,39 @@ impl TurnState {
 
     pub(crate) fn clear_pending(&mut self) {
         self.pending_approvals.clear();
+        self.pending_user_input.clear();
+        self.pending_dynamic_tools.clear();
         self.pending_input.clear();
+    }
+
+    pub(crate) fn insert_pending_user_input(
+        &mut self,
+        key: String,
+        tx: oneshot::Sender<RequestUserInputResponse>,
+    ) -> Option<oneshot::Sender<RequestUserInputResponse>> {
+        self.pending_user_input.insert(key, tx)
+    }
+
+    pub(crate) fn remove_pending_user_input(
+        &mut self,
+        key: &str,
+    ) -> Option<oneshot::Sender<RequestUserInputResponse>> {
+        self.pending_user_input.remove(key)
+    }
+
+    pub(crate) fn insert_pending_dynamic_tool(
+        &mut self,
+        key: String,
+        tx: oneshot::Sender<DynamicToolResponse>,
+    ) -> Option<oneshot::Sender<DynamicToolResponse>> {
+        self.pending_dynamic_tools.insert(key, tx)
+    }
+
+    pub(crate) fn remove_pending_dynamic_tool(
+        &mut self,
+        key: &str,
+    ) -> Option<oneshot::Sender<DynamicToolResponse>> {
+        self.pending_dynamic_tools.remove(key)
     }
 
     pub(crate) fn push_pending_input(&mut self, input: ResponseInputItem) {
@@ -97,6 +141,10 @@ impl TurnState {
             ret
         }
     }
+
+    pub(crate) fn has_pending_input(&self) -> bool {
+        !self.pending_input.is_empty()
+    }
 }
 
 impl ActiveTurn {
@@ -104,12 +152,5 @@ impl ActiveTurn {
     pub(crate) async fn clear_pending(&self) {
         let mut ts = self.turn_state.lock().await;
         ts.clear_pending();
-    }
-
-    /// Best-effort, non-blocking variant for synchronous contexts (Drop/interrupt).
-    pub(crate) fn try_clear_pending_sync(&self) {
-        if let Ok(mut ts) = self.turn_state.try_lock() {
-            ts.clear_pending();
-        }
     }
 }

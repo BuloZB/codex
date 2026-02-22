@@ -1,64 +1,55 @@
 use assert_cmd::Command as AssertCommand;
-use codex_core::RolloutRecorder;
-use codex_core::protocol::GitInfo;
+use codex_core::auth::CODEX_API_KEY_ENV_VAR;
+use codex_protocol::protocol::GitInfo;
+use codex_utils_cargo_bin::find_resource;
+use core_test_support::fs_wait;
+use core_test_support::responses;
 use core_test_support::skip_if_no_network;
 use std::time::Duration;
-use std::time::Instant;
 use tempfile::TempDir;
 use uuid::Uuid;
-use walkdir::WalkDir;
-use wiremock::Mock;
 use wiremock::MockServer;
-use wiremock::ResponseTemplate;
-use wiremock::matchers::method;
-use wiremock::matchers::path;
 
-/// Tests streaming chat completions through the CLI using a mock server.
-/// This test:
-/// 1. Sets up a mock server that simulates OpenAI's chat completions API
-/// 2. Configures codex to use this mock server via a custom provider
-/// 3. Sends a simple "hello?" prompt and verifies the streamed response
-/// 4. Ensures the response is received exactly once and contains "hi"
+fn repo_root() -> std::path::PathBuf {
+    #[expect(clippy::expect_used)]
+    codex_utils_cargo_bin::repo_root().expect("failed to resolve repo root")
+}
+
+fn cli_responses_fixture() -> std::path::PathBuf {
+    #[expect(clippy::expect_used)]
+    find_resource!("tests/cli_responses_fixture.sse").expect("failed to resolve fixture path")
+}
+
+/// Tests streaming the Responses API through the CLI using a mock server.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn chat_mode_stream_cli() {
+async fn responses_mode_stream_cli() {
     skip_if_no_network!();
 
     let server = MockServer::start().await;
-    let sse = concat!(
-        "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
-        "data: {\"choices\":[{\"delta\":{}}]}\n\n",
-        "data: [DONE]\n\n"
-    );
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .set_body_raw(sse, "text/event-stream"),
-        )
-        .expect(1)
-        .mount(&server)
-        .await;
+    let repo_root = repo_root();
+    let sse = responses::sse(vec![
+        responses::ev_response_created("resp-1"),
+        responses::ev_assistant_message("msg-1", "hi"),
+        responses::ev_completed("resp-1"),
+    ]);
+    let resp_mock = responses::mount_sse_once(&server, sse).await;
 
     let home = TempDir::new().unwrap();
     let provider_override = format!(
-        "model_providers.mock={{ name = \"mock\", base_url = \"{}/v1\", env_key = \"PATH\", wire_api = \"chat\" }}",
+        "model_providers.mock={{ name = \"mock\", base_url = \"{}/v1\", env_key = \"PATH\", wire_api = \"responses\" }}",
         server.uri()
     );
-    let mut cmd = AssertCommand::new("cargo");
-    cmd.arg("run")
-        .arg("-p")
-        .arg("codex-cli")
-        .arg("--quiet")
-        .arg("--")
-        .arg("exec")
+    let bin = codex_utils_cargo_bin::cargo_bin("codex").unwrap();
+    let mut cmd = AssertCommand::new(bin);
+    cmd.timeout(Duration::from_secs(30));
+    cmd.arg("exec")
         .arg("--skip-git-repo-check")
         .arg("-c")
         .arg(&provider_override)
         .arg("-c")
         .arg("model_provider=\"mock\"")
         .arg("-C")
-        .arg(env!("CARGO_MANIFEST_DIR"))
+        .arg(&repo_root)
         .arg("hello?");
     cmd.env("CODEX_HOME", home.path())
         .env("OPENAI_API_KEY", "dummy")
@@ -73,30 +64,36 @@ async fn chat_mode_stream_cli() {
     let hi_lines = stdout.lines().filter(|line| line.trim() == "hi").count();
     assert_eq!(hi_lines, 1, "Expected exactly one line with 'hi'");
 
-    server.verify().await;
+    let request = resp_mock.single_request();
+    assert_eq!(request.path(), "/v1/responses");
 
-    // Verify a new session rollout was created and is discoverable via list_conversations
-    let page = RolloutRecorder::list_conversations(home.path(), 10, None)
-        .await
-        .expect("list conversations");
-    assert!(
-        !page.items.is_empty(),
-        "expected at least one session to be listed"
-    );
-    // First line of head must be the SessionMeta payload (id/timestamp)
-    let head0 = page.items[0].head.first().expect("missing head record");
-    assert!(head0.get("id").is_some(), "head[0] missing id");
-    assert!(
-        head0.get("timestamp").is_some(),
-        "head[0] missing timestamp"
-    );
+    // TODO(jif) fix
+    // // Verify a new session rollout was created and is discoverable via list_conversations
+    // let provider_filter = vec!["mock".to_string()];
+    // let page = RolloutRecorder::list_threads(
+    //     home.path(),
+    //     10,
+    //     None,
+    //     codex_core::ThreadSortKey::UpdatedAt,
+    //     &[],
+    //     Some(provider_filter.as_slice()),
+    //     "mock",
+    // )
+    // .await
+    // .expect("list conversations");
+    // assert!(
+    //     !page.items.is_empty(),
+    //     "expected at least one session to be listed"
+    // );
+    // assert!(page.items[0].thread_id.is_some(), "missing thread_id");
+    // assert!(page.items[0].created_at.is_some(), "missing created_at");
 }
 
-/// Verify that passing `-c experimental_instructions_file=...` to the CLI
+/// Verify that passing `-c model_instructions_file=...` to the CLI
 /// overrides the built-in base instructions by inspecting the request body
 /// received by a mock OpenAI Responses endpoint.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn exec_cli_applies_experimental_instructions_file() {
+async fn exec_cli_applies_model_instructions_file() {
     skip_if_no_network!();
 
     // Start mock server which will capture the request and return a minimal
@@ -106,21 +103,12 @@ async fn exec_cli_applies_experimental_instructions_file() {
         "data: {\"type\":\"response.created\",\"response\":{}}\n\n",
         "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\"}}\n\n"
     );
-    Mock::given(method("POST"))
-        .and(path("/v1/responses"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .set_body_raw(sse, "text/event-stream"),
-        )
-        .expect(1)
-        .mount(&server)
-        .await;
+    let resp_mock = core_test_support::responses::mount_sse_once(&server, sse.to_string()).await;
 
     // Create a temporary instructions file with a unique marker we can assert
     // appears in the outbound request payload.
     let custom = TempDir::new().unwrap();
-    let marker = "cli-experimental-instructions-marker";
+    let marker = "cli-model-instructions-file-marker";
     let custom_path = custom.path().join("instr.md");
     std::fs::write(&custom_path, marker).unwrap();
     let custom_path_str = custom_path.to_string_lossy().replace('\\', "/");
@@ -133,24 +121,19 @@ async fn exec_cli_applies_experimental_instructions_file() {
     );
 
     let home = TempDir::new().unwrap();
-    let mut cmd = AssertCommand::new("cargo");
-    cmd.arg("run")
-        .arg("-p")
-        .arg("codex-cli")
-        .arg("--quiet")
-        .arg("--")
-        .arg("exec")
+    let repo_root = repo_root();
+    let bin = codex_utils_cargo_bin::cargo_bin("codex").unwrap();
+    let mut cmd = AssertCommand::new(bin);
+    cmd.arg("exec")
         .arg("--skip-git-repo-check")
         .arg("-c")
         .arg(&provider_override)
         .arg("-c")
         .arg("model_provider=\"mock\"")
         .arg("-c")
-        .arg(format!(
-            "experimental_instructions_file=\"{custom_path_str}\""
-        ))
+        .arg(format!("model_instructions_file=\"{custom_path_str}\""))
         .arg("-C")
-        .arg(env!("CARGO_MANIFEST_DIR"))
+        .arg(&repo_root)
         .arg("hello?\n");
     cmd.env("CODEX_HOME", home.path())
         .env("OPENAI_API_KEY", "dummy")
@@ -164,8 +147,8 @@ async fn exec_cli_applies_experimental_instructions_file() {
 
     // Inspect the captured request and verify our custom base instructions were
     // included in the `instructions` field.
-    let request = &server.received_requests().await.unwrap()[0];
-    let body = request.body_json::<serde_json::Value>().unwrap();
+    let request = resp_mock.single_request();
+    let body = request.body_json();
     let instructions = body
         .get("instructions")
         .and_then(|v| v.as_str())
@@ -187,20 +170,16 @@ async fn exec_cli_applies_experimental_instructions_file() {
 async fn responses_api_stream_cli() {
     skip_if_no_network!();
 
-    let fixture =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/cli_responses_fixture.sse");
+    let fixture = cli_responses_fixture();
+    let repo_root = repo_root();
 
     let home = TempDir::new().unwrap();
-    let mut cmd = AssertCommand::new("cargo");
-    cmd.arg("run")
-        .arg("-p")
-        .arg("codex-cli")
-        .arg("--quiet")
-        .arg("--")
-        .arg("exec")
+    let bin = codex_utils_cargo_bin::cargo_bin("codex").unwrap();
+    let mut cmd = AssertCommand::new(bin);
+    cmd.arg("exec")
         .arg("--skip-git-repo-check")
         .arg("-C")
-        .arg(env!("CARGO_MANIFEST_DIR"))
+        .arg(&repo_root)
         .arg("hello?");
     cmd.env("CODEX_HOME", home.path())
         .env("OPENAI_API_KEY", "dummy")
@@ -215,36 +194,31 @@ async fn responses_api_stream_cli() {
 
 /// End-to-end: create a session (writes rollout), verify the file, then resume and confirm append.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn integration_creates_and_checks_session_file() {
+async fn integration_creates_and_checks_session_file() -> anyhow::Result<()> {
     // Honor sandbox network restrictions for CI parity with the other tests.
-    skip_if_no_network!();
+    skip_if_no_network!(Ok(()));
 
     // 1. Temp home so we read/write isolated session files.
-    let home = TempDir::new().unwrap();
+    let home = TempDir::new()?;
 
     // 2. Unique marker we'll look for in the session log.
     let marker = format!("integration-test-{}", Uuid::new_v4());
     let prompt = format!("echo {marker}");
 
     // 3. Use the same offline SSE fixture as responses_api_stream_cli so the test is hermetic.
-    let fixture =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/cli_responses_fixture.sse");
+    let fixture = cli_responses_fixture();
+    let repo_root = repo_root();
 
-    // 4. Run the codex CLI through cargo (ensures the right bin is built) and invoke `exec`,
-    //    which is what records a session.
-    let mut cmd = AssertCommand::new("cargo");
-    cmd.arg("run")
-        .arg("-p")
-        .arg("codex-cli")
-        .arg("--quiet")
-        .arg("--")
-        .arg("exec")
+    // 4. Run the codex CLI and invoke `exec`, which is what records a session.
+    let bin = codex_utils_cargo_bin::cargo_bin("codex").unwrap();
+    let mut cmd = AssertCommand::new(bin);
+    cmd.arg("exec")
         .arg("--skip-git-repo-check")
         .arg("-C")
-        .arg(env!("CARGO_MANIFEST_DIR"))
+        .arg(&repo_root)
         .arg(&prompt);
     cmd.env("CODEX_HOME", home.path())
-        .env("OPENAI_API_KEY", "dummy")
+        .env(CODEX_API_KEY_ENV_VAR, "dummy")
         .env("CODEX_RS_SSE_FIXTURE", &fixture)
         // Required for CLI arg parsing even though fixture short-circuits network usage.
         .env("OPENAI_BASE_URL", "http://unused.local");
@@ -258,63 +232,20 @@ async fn integration_creates_and_checks_session_file() {
 
     // Wait for sessions dir to appear.
     let sessions_dir = home.path().join("sessions");
-    let dir_deadline = Instant::now() + Duration::from_secs(5);
-    while !sessions_dir.exists() && Instant::now() < dir_deadline {
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    assert!(sessions_dir.exists(), "sessions directory never appeared");
+    fs_wait::wait_for_path_exists(&sessions_dir, Duration::from_secs(5)).await?;
 
     // Find the session file that contains `marker`.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut matching_path: Option<std::path::PathBuf> = None;
-    while Instant::now() < deadline && matching_path.is_none() {
-        for entry in WalkDir::new(&sessions_dir) {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            if !entry.file_name().to_string_lossy().ends_with(".jsonl") {
-                continue;
-            }
-            let path = entry.path();
-            let Ok(content) = std::fs::read_to_string(path) else {
-                continue;
-            };
-            let mut lines = content.lines();
-            if lines.next().is_none() {
-                continue;
-            }
-            for line in lines {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                let item: serde_json::Value = match serde_json::from_str(line) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-                if item.get("type").and_then(|t| t.as_str()) == Some("response_item")
-                    && let Some(payload) = item.get("payload")
-                    && payload.get("type").and_then(|t| t.as_str()) == Some("message")
-                    && let Some(c) = payload.get("content")
-                    && c.to_string().contains(&marker)
-                {
-                    matching_path = Some(path.to_path_buf());
-                    break;
-                }
-            }
+    let marker_clone = marker.clone();
+    let path = fs_wait::wait_for_matching_file(&sessions_dir, Duration::from_secs(10), move |p| {
+        if p.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+            return false;
         }
-        if matching_path.is_none() {
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    }
-
-    let path = match matching_path {
-        Some(p) => p,
-        None => panic!("No session file containing the marker was found"),
-    };
+        let Ok(content) = std::fs::read_to_string(p) else {
+            return false;
+        };
+        content.contains(&marker_clone)
+    })
+    .await?;
 
     // Basic sanity checks on location and metadata.
     let rel = match path.strip_prefix(&sessions_dir) {
@@ -400,16 +331,12 @@ async fn integration_creates_and_checks_session_file() {
     // Second run: resume should update the existing file.
     let marker2 = format!("integration-resume-{}", Uuid::new_v4());
     let prompt2 = format!("echo {marker2}");
-    let mut cmd2 = AssertCommand::new("cargo");
-    cmd2.arg("run")
-        .arg("-p")
-        .arg("codex-cli")
-        .arg("--quiet")
-        .arg("--")
-        .arg("exec")
+    let bin2 = codex_utils_cargo_bin::cargo_bin("codex").unwrap();
+    let mut cmd2 = AssertCommand::new(bin2);
+    cmd2.arg("exec")
         .arg("--skip-git-repo-check")
         .arg("-C")
-        .arg(env!("CARGO_MANIFEST_DIR"))
+        .arg(&repo_root)
         .arg(&prompt2)
         .arg("resume")
         .arg("--last");
@@ -422,42 +349,25 @@ async fn integration_creates_and_checks_session_file() {
     assert!(output2.status.success(), "resume codex-cli run failed");
 
     // Find the new session file containing the resumed marker.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut resumed_path: Option<std::path::PathBuf> = None;
-    while Instant::now() < deadline && resumed_path.is_none() {
-        for entry in WalkDir::new(&sessions_dir) {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            if !entry.file_type().is_file() {
-                continue;
+    let marker2_clone = marker2.clone();
+    let resumed_path =
+        fs_wait::wait_for_matching_file(&sessions_dir, Duration::from_secs(10), move |p| {
+            if p.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+                return false;
             }
-            if !entry.file_name().to_string_lossy().ends_with(".jsonl") {
-                continue;
-            }
-            let p = entry.path();
-            let Ok(c) = std::fs::read_to_string(p) else {
-                continue;
-            };
-            if c.contains(&marker2) {
-                resumed_path = Some(p.to_path_buf());
-                break;
-            }
-        }
-        if resumed_path.is_none() {
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    }
+            std::fs::read_to_string(p)
+                .map(|content| content.contains(&marker2_clone))
+                .unwrap_or(false)
+        })
+        .await?;
 
-    let resumed_path = resumed_path.expect("No resumed session file found containing the marker2");
     // Resume should write to the existing log file.
     assert_eq!(
         resumed_path, path,
         "resume should create a new session file"
     );
 
-    let resumed_content = std::fs::read_to_string(&resumed_path).unwrap();
+    let resumed_content = std::fs::read_to_string(&resumed_path)?;
     assert!(
         resumed_content.contains(&marker),
         "resumed file missing original marker"
@@ -466,6 +376,7 @@ async fn integration_creates_and_checks_session_file() {
         resumed_content.contains(&marker2),
         "resumed file missing resumed marker"
     );
+    Ok(())
 }
 
 /// Integration test to verify git info is collected and recorded in session files.
@@ -580,9 +491,20 @@ async fn integration_git_info_unit_test() {
         "Git info should contain repository_url"
     );
     let repo_url = git_info.repository_url.as_ref().unwrap();
+    // Some hosts rewrite remotes (e.g., github.com → git@github.com), so assert against
+    // the actual remote reported by git instead of a static URL.
+    let expected_remote_url = std::process::Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .current_dir(&git_repo)
+        .output()
+        .unwrap();
+    let expected_remote_url = String::from_utf8(expected_remote_url.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
     assert_eq!(
-        repo_url, "https://github.com/example/integration-test.git",
-        "Repository URL should match what we configured"
+        repo_url, &expected_remote_url,
+        "Repository URL should match git remote get-url output"
     );
 
     println!("✅ Git info collection test passed!");

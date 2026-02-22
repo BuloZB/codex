@@ -1,3 +1,6 @@
+//! Local OAuth callback server for CLI login.
+//!
+//! This module runs the short-lived localhost server used by interactive sign-in.
 use std::io::Cursor;
 use std::io::Read;
 use std::io::Write;
@@ -14,21 +17,25 @@ use crate::pkce::PkceCodes;
 use crate::pkce::generate_pkce;
 use base64::Engine;
 use chrono::Utc;
+use codex_app_server_protocol::AuthMode;
+use codex_core::auth::AuthCredentialsStoreMode;
 use codex_core::auth::AuthDotJson;
-use codex_core::auth::get_auth_file;
-use codex_core::default_client::ORIGINATOR;
+use codex_core::auth::save_auth;
+use codex_core::default_client::originator;
 use codex_core::token_data::TokenData;
-use codex_core::token_data::parse_id_token;
+use codex_core::token_data::parse_chatgpt_jwt_claims;
 use rand::RngCore;
 use serde_json::Value as JsonValue;
 use tiny_http::Header;
 use tiny_http::Request;
 use tiny_http::Response;
 use tiny_http::Server;
+use tiny_http::StatusCode;
 
 const DEFAULT_ISSUER: &str = "https://auth.openai.com";
 const DEFAULT_PORT: u16 = 1455;
 
+/// Options for launching the local login callback server.
 #[derive(Debug, Clone)]
 pub struct ServerOptions {
     pub codex_home: PathBuf,
@@ -37,10 +44,18 @@ pub struct ServerOptions {
     pub port: u16,
     pub open_browser: bool,
     pub force_state: Option<String>,
+    pub forced_chatgpt_workspace_id: Option<String>,
+    pub cli_auth_credentials_store_mode: AuthCredentialsStoreMode,
 }
 
 impl ServerOptions {
-    pub fn new(codex_home: PathBuf, client_id: String) -> Self {
+    /// Creates a server configuration with the default issuer and port.
+    pub fn new(
+        codex_home: PathBuf,
+        client_id: String,
+        forced_chatgpt_workspace_id: Option<String>,
+        cli_auth_credentials_store_mode: AuthCredentialsStoreMode,
+    ) -> Self {
         Self {
             codex_home,
             client_id,
@@ -48,10 +63,13 @@ impl ServerOptions {
             port: DEFAULT_PORT,
             open_browser: true,
             force_state: None,
+            forced_chatgpt_workspace_id,
+            cli_auth_credentials_store_mode,
         }
     }
 }
 
+/// Handle for a running login callback server.
 pub struct LoginServer {
     pub auth_url: String,
     pub actual_port: u16,
@@ -60,32 +78,38 @@ pub struct LoginServer {
 }
 
 impl LoginServer {
+    /// Waits for the login callback loop to finish.
     pub async fn block_until_done(self) -> io::Result<()> {
         self.server_handle
             .await
             .map_err(|err| io::Error::other(format!("login server thread panicked: {err:?}")))?
     }
 
+    /// Requests shutdown of the callback server.
     pub fn cancel(&self) {
         self.shutdown_handle.shutdown();
     }
 
+    /// Returns a cloneable cancel handle for the running server.
     pub fn cancel_handle(&self) -> ShutdownHandle {
         self.shutdown_handle.clone()
     }
 }
 
+/// Handle used to signal the login server loop to exit.
 #[derive(Clone, Debug)]
 pub struct ShutdownHandle {
     shutdown_notify: Arc<tokio::sync::Notify>,
 }
 
 impl ShutdownHandle {
+    /// Signals the login loop to terminate.
     pub fn shutdown(&self) {
         self.shutdown_notify.notify_waiters();
     }
 }
 
+/// Starts a local callback server and returns the browser auth URL.
 pub fn run_login_server(opts: ServerOptions) -> io::Result<LoginServer> {
     let pkce = generate_pkce();
     let state = opts.force_state.clone().unwrap_or_else(generate_state);
@@ -103,7 +127,14 @@ pub fn run_login_server(opts: ServerOptions) -> io::Result<LoginServer> {
     let server = Arc::new(server);
 
     let redirect_uri = format!("http://localhost:{actual_port}/auth/callback");
-    let auth_url = build_authorize_url(&opts.issuer, &opts.client_id, &redirect_uri, &pkce, &state);
+    let auth_url = build_authorize_url(
+        &opts.issuer,
+        &opts.client_id,
+        &redirect_uri,
+        &pkce,
+        &state,
+        opts.forced_chatgpt_workspace_id.as_deref(),
+    );
 
     if opts.open_browser {
         let _ = webbrowser::open(&auth_url);
@@ -148,8 +179,15 @@ pub fn run_login_server(opts: ServerOptions) -> io::Result<LoginServer> {
                                 let _ = tokio::task::spawn_blocking(move || req.respond(response)).await;
                                 None
                             }
-                            HandledRequest::ResponseAndExit { response, result } => {
-                                let _ = tokio::task::spawn_blocking(move || req.respond(response)).await;
+                            HandledRequest::ResponseAndExit {
+                                headers,
+                                body,
+                                result,
+                            } => {
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    send_response_with_disconnect(req, headers, body)
+                                })
+                                .await;
                                 Some(result)
                             }
                             HandledRequest::RedirectWithHeader(header) => {
@@ -181,11 +219,13 @@ pub fn run_login_server(opts: ServerOptions) -> io::Result<LoginServer> {
     })
 }
 
+/// Internal callback handling outcome.
 enum HandledRequest {
     Response(Response<Cursor<Vec<u8>>>),
     RedirectWithHeader(Header),
     ResponseAndExit {
-        response: Response<Cursor<Vec<u8>>>,
+        headers: Vec<Header>,
+        body: Vec<u8>,
         result: io::Result<()>,
     },
 }
@@ -218,11 +258,25 @@ async fn process_request(
                     Response::from_string("State mismatch").with_status_code(400),
                 );
             }
+            if let Some(error_code) = params.get("error") {
+                let error_description = params.get("error_description").map(String::as_str);
+                let message = oauth_callback_error_message(error_code, error_description);
+                eprintln!("OAuth callback error: {message}");
+                return login_error_response(
+                    &message,
+                    io::ErrorKind::PermissionDenied,
+                    Some(error_code),
+                    error_description,
+                );
+            }
             let code = match params.get("code") {
                 Some(c) if !c.is_empty() => c.clone(),
                 _ => {
-                    return HandledRequest::Response(
-                        Response::from_string("Missing authorization code").with_status_code(400),
+                    return login_error_response(
+                        "Missing authorization code. Sign-in could not be completed.",
+                        io::ErrorKind::InvalidData,
+                        Some("missing_authorization_code"),
+                        None,
                     );
                 }
             };
@@ -231,6 +285,18 @@ async fn process_request(
                 .await
             {
                 Ok(tokens) => {
+                    if let Err(message) = ensure_workspace_allowed(
+                        opts.forced_chatgpt_workspace_id.as_deref(),
+                        &tokens.id_token,
+                    ) {
+                        eprintln!("Workspace restriction error: {message}");
+                        return login_error_response(
+                            &message,
+                            io::ErrorKind::PermissionDenied,
+                            Some("workspace_restriction"),
+                            None,
+                        );
+                    }
                     // Obtain API key via token-exchange and persist
                     let api_key = obtain_api_key(&opts.issuer, &opts.client_id, &tokens.id_token)
                         .await
@@ -241,13 +307,16 @@ async fn process_request(
                         tokens.id_token.clone(),
                         tokens.access_token.clone(),
                         tokens.refresh_token.clone(),
+                        opts.cli_auth_credentials_store_mode,
                     )
                     .await
                     {
                         eprintln!("Persist error: {err}");
-                        return HandledRequest::Response(
-                            Response::from_string(format!("Unable to persist auth file: {err}"))
-                                .with_status_code(500),
+                        return login_error_response(
+                            "Sign-in completed but credentials could not be saved locally.",
+                            io::ErrorKind::Other,
+                            Some("persist_failed"),
+                            Some(&err.to_string()),
                         );
                     }
 
@@ -259,36 +328,42 @@ async fn process_request(
                     );
                     match tiny_http::Header::from_bytes(&b"Location"[..], success_url.as_bytes()) {
                         Ok(header) => HandledRequest::RedirectWithHeader(header),
-                        Err(_) => HandledRequest::Response(
-                            Response::from_string("Internal Server Error").with_status_code(500),
+                        Err(_) => login_error_response(
+                            "Sign-in completed but redirecting back to Codex failed.",
+                            io::ErrorKind::Other,
+                            Some("redirect_failed"),
+                            None,
                         ),
                     }
                 }
                 Err(err) => {
                     eprintln!("Token exchange error: {err}");
-                    HandledRequest::Response(
-                        Response::from_string(format!("Token exchange failed: {err}"))
-                            .with_status_code(500),
+                    login_error_response(
+                        &format!("Token exchange failed: {err}"),
+                        io::ErrorKind::Other,
+                        Some("token_exchange_failed"),
+                        None,
                     )
                 }
             }
         }
         "/success" => {
             let body = include_str!("assets/success.html");
-            let mut resp = Response::from_data(body.as_bytes());
-            if let Ok(h) = tiny_http::Header::from_bytes(
-                &b"Content-Type"[..],
-                &b"text/html; charset=utf-8"[..],
-            ) {
-                resp.add_header(h);
-            }
             HandledRequest::ResponseAndExit {
-                response: resp,
+                headers: match Header::from_bytes(
+                    &b"Content-Type"[..],
+                    &b"text/html; charset=utf-8"[..],
+                ) {
+                    Ok(header) => vec![header],
+                    Err(_) => Vec::new(),
+                },
+                body: body.as_bytes().to_vec(),
                 result: Ok(()),
             }
         }
         "/cancel" => HandledRequest::ResponseAndExit {
-            response: Response::from_string("Login cancelled"),
+            headers: Vec::new(),
+            body: b"Login cancelled".to_vec(),
             result: Err(io::Error::new(
                 io::ErrorKind::Interrupted,
                 "Login cancelled",
@@ -298,28 +373,85 @@ async fn process_request(
     }
 }
 
+/// tiny_http filters `Connection` headers out of `Response` objects, so using
+/// `req.respond` never informs the client (or the library) that a keep-alive
+/// socket should be closed. That leaves the per-connection worker parked in a
+/// loop waiting for more requests, which in turn causes the next login attempt
+/// to hang on the old connection. This helper bypasses tiny_http’s response
+/// machinery: it extracts the raw writer, prints the HTTP response manually,
+/// and always appends `Connection: close`, ensuring the socket is closed from
+/// the server side. Ideally, tiny_http would provide an API to control
+/// server-side connection persistence, but it does not.
+fn send_response_with_disconnect(
+    req: Request,
+    mut headers: Vec<Header>,
+    body: Vec<u8>,
+) -> io::Result<()> {
+    let status = StatusCode(200);
+    let mut writer = req.into_writer();
+    let reason = status.default_reason_phrase();
+    write!(writer, "HTTP/1.1 {} {}\r\n", status.0, reason)?;
+    headers.retain(|h| !h.field.equiv("Connection"));
+    if let Ok(close_header) = Header::from_bytes(&b"Connection"[..], &b"close"[..]) {
+        headers.push(close_header);
+    }
+
+    let content_length_value = format!("{}", body.len());
+    if let Ok(content_length_header) =
+        Header::from_bytes(&b"Content-Length"[..], content_length_value.as_bytes())
+    {
+        headers.push(content_length_header);
+    }
+
+    for header in headers {
+        write!(
+            writer,
+            "{}: {}\r\n",
+            header.field.as_str(),
+            header.value.as_str()
+        )?;
+    }
+
+    writer.write_all(b"\r\n")?;
+    writer.write_all(&body)?;
+    writer.flush()
+}
+
 fn build_authorize_url(
     issuer: &str,
     client_id: &str,
     redirect_uri: &str,
     pkce: &PkceCodes,
     state: &str,
+    forced_chatgpt_workspace_id: Option<&str>,
 ) -> String {
-    let query = vec![
-        ("response_type", "code"),
-        ("client_id", client_id),
-        ("redirect_uri", redirect_uri),
-        ("scope", "openid profile email offline_access"),
-        ("code_challenge", &pkce.code_challenge),
-        ("code_challenge_method", "S256"),
-        ("id_token_add_organizations", "true"),
-        ("codex_cli_simplified_flow", "true"),
-        ("state", state),
-        ("originator", ORIGINATOR.value.as_str()),
+    let mut query = vec![
+        ("response_type".to_string(), "code".to_string()),
+        ("client_id".to_string(), client_id.to_string()),
+        ("redirect_uri".to_string(), redirect_uri.to_string()),
+        (
+            "scope".to_string(),
+            "openid profile email offline_access".to_string(),
+        ),
+        (
+            "code_challenge".to_string(),
+            pkce.code_challenge.to_string(),
+        ),
+        ("code_challenge_method".to_string(), "S256".to_string()),
+        ("id_token_add_organizations".to_string(), "true".to_string()),
+        ("codex_cli_simplified_flow".to_string(), "true".to_string()),
+        ("state".to_string(), state.to_string()),
+        (
+            "originator".to_string(),
+            originator().value.as_str().to_string(),
+        ),
     ];
+    if let Some(workspace_id) = forced_chatgpt_workspace_id {
+        query.push(("allowed_workspace_id".to_string(), workspace_id.to_string()));
+    }
     let qs = query
         .into_iter()
-        .map(|(k, v)| format!("{}={}", k, urlencoding::encode(v)))
+        .map(|(k, v)| format!("{k}={}", urlencoding::encode(&v)))
         .collect::<Vec<_>>()
         .join("&");
     format!("{issuer}/oauth/authorize?{qs}")
@@ -393,13 +525,15 @@ fn bind_server(port: u16) -> io::Result<Server> {
     }
 }
 
-struct ExchangedTokens {
-    id_token: String,
-    access_token: String,
-    refresh_token: String,
+/// Tokens returned by the OAuth authorization-code exchange.
+pub(crate) struct ExchangedTokens {
+    pub id_token: String,
+    pub access_token: String,
+    pub refresh_token: String,
 }
 
-async fn exchange_code_for_tokens(
+/// Exchanges an authorization code for tokens.
+pub(crate) async fn exchange_code_for_tokens(
     issuer: &str,
     client_id: &str,
     redirect_uri: &str,
@@ -428,10 +562,12 @@ async fn exchange_code_for_tokens(
         .await
         .map_err(io::Error::other)?;
 
-    if !resp.status().is_success() {
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.map_err(io::Error::other)?;
+        let detail = parse_token_endpoint_error(&body);
         return Err(io::Error::other(format!(
-            "token endpoint returned status {}",
-            resp.status()
+            "token endpoint returned status {status}: {detail}"
         )));
     }
 
@@ -443,25 +579,20 @@ async fn exchange_code_for_tokens(
     })
 }
 
-async fn persist_tokens_async(
+/// Persists exchanged credentials using the configured local auth store.
+pub(crate) async fn persist_tokens_async(
     codex_home: &Path,
     api_key: Option<String>,
     id_token: String,
     access_token: String,
     refresh_token: String,
+    auth_credentials_store_mode: AuthCredentialsStoreMode,
 ) -> io::Result<()> {
     // Reuse existing synchronous logic but run it off the async runtime.
     let codex_home = codex_home.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        let auth_file = get_auth_file(&codex_home);
-        if let Some(parent) = auth_file.parent()
-            && !parent.exists()
-        {
-            std::fs::create_dir_all(parent).map_err(io::Error::other)?;
-        }
-
         let mut tokens = TokenData {
-            id_token: parse_id_token(&id_token).map_err(io::Error::other)?,
+            id_token: parse_chatgpt_jwt_claims(&id_token).map_err(io::Error::other)?,
             access_token,
             refresh_token,
             account_id: None,
@@ -473,11 +604,12 @@ async fn persist_tokens_async(
             tokens.account_id = Some(acc.to_string());
         }
         let auth = AuthDotJson {
+            auth_mode: Some(AuthMode::Chatgpt),
             openai_api_key: api_key,
             tokens: Some(tokens),
             last_refresh: Some(Utc::now()),
         };
-        codex_core::auth::write_auth_json(&auth_file, &auth)
+        save_auth(&codex_home, &auth, auth_credentials_store_mode)
     })
     .await
     .map_err(|e| io::Error::other(format!("persist task failed: {e}")))?
@@ -562,7 +694,159 @@ fn jwt_auth_claims(jwt: &str) -> serde_json::Map<String, serde_json::Value> {
     serde_json::Map::new()
 }
 
-async fn obtain_api_key(issuer: &str, client_id: &str, id_token: &str) -> io::Result<String> {
+/// Validates the ID token against an optional workspace restriction.
+pub(crate) fn ensure_workspace_allowed(
+    expected: Option<&str>,
+    id_token: &str,
+) -> Result<(), String> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+
+    let claims = jwt_auth_claims(id_token);
+    let Some(actual) = claims.get("chatgpt_account_id").and_then(JsonValue::as_str) else {
+        return Err("Login is restricted to a specific workspace, but the token did not include an chatgpt_account_id claim.".to_string());
+    };
+
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(format!("Login is restricted to workspace id {expected}."))
+    }
+}
+
+/// Builds a terminal callback response for login failures.
+fn login_error_response(
+    message: &str,
+    kind: io::ErrorKind,
+    error_code: Option<&str>,
+    error_description: Option<&str>,
+) -> HandledRequest {
+    let mut headers = Vec::new();
+    if let Ok(header) = Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]) {
+        headers.push(header);
+    }
+    let body = render_login_error_page(message, error_code, error_description);
+    HandledRequest::ResponseAndExit {
+        headers,
+        body,
+        result: Err(io::Error::new(kind, message.to_string())),
+    }
+}
+
+/// Returns true when the OAuth callback represents a missing Codex entitlement.
+fn is_missing_codex_entitlement_error(error_code: &str, error_description: Option<&str>) -> bool {
+    error_code == "access_denied"
+        && error_description.is_some_and(|description| {
+            description
+                .to_ascii_lowercase()
+                .contains("missing_codex_entitlement")
+        })
+}
+
+/// Converts OAuth callback errors into a user-facing message.
+fn oauth_callback_error_message(error_code: &str, error_description: Option<&str>) -> String {
+    if is_missing_codex_entitlement_error(error_code, error_description) {
+        return "Codex is not enabled for your workspace. Contact your workspace administrator to request access to Codex.".to_string();
+    }
+
+    if let Some(description) = error_description
+        && !description.trim().is_empty()
+    {
+        return format!("Sign-in failed: {description}");
+    }
+
+    format!("Sign-in failed: {error_code}")
+}
+
+/// Extracts a readable error from token endpoint responses.
+fn parse_token_endpoint_error(body: &str) -> String {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return "unknown error".to_string();
+    }
+
+    let parsed = serde_json::from_str::<JsonValue>(trimmed).ok();
+    if let Some(json) = parsed {
+        if let Some(description) = json.get("error_description").and_then(JsonValue::as_str)
+            && !description.trim().is_empty()
+        {
+            return description.to_string();
+        }
+        if let Some(error_obj) = json.get("error")
+            && let Some(message) = error_obj.get("message").and_then(JsonValue::as_str)
+            && !message.trim().is_empty()
+        {
+            return message.to_string();
+        }
+        if let Some(error_code) = json.get("error").and_then(JsonValue::as_str)
+            && !error_code.trim().is_empty()
+        {
+            return error_code.to_string();
+        }
+    }
+
+    trimmed.to_string()
+}
+
+/// Renders the branded error page used by callback failures.
+fn render_login_error_page(
+    message: &str,
+    error_code: Option<&str>,
+    error_description: Option<&str>,
+) -> Vec<u8> {
+    let template = include_str!("assets/error.html");
+    let code = error_code.unwrap_or("unknown_error");
+    let (title, display_message, display_description, help_text) =
+        if is_missing_codex_entitlement_error(code, error_description) {
+            (
+                "You do not have access to Codex".to_string(),
+                "This account is not currently authorized to use Codex in this workspace."
+                    .to_string(),
+                "Contact your workspace administrator to request access to Codex.".to_string(),
+                "Contact your workspace administrator to get access to Codex, then return to Codex and try again."
+                    .to_string(),
+            )
+        } else {
+            (
+                "Sign-in could not be completed".to_string(),
+                message.to_string(),
+                error_description.unwrap_or(message).to_string(),
+                "Return to Codex to retry, switch accounts, or contact your workspace admin if access is restricted."
+                    .to_string(),
+            )
+        };
+    template
+        .replace("__ERROR_TITLE__", &html_escape(&title))
+        .replace("__ERROR_MESSAGE__", &html_escape(&display_message))
+        .replace("__ERROR_CODE__", &html_escape(code))
+        .replace("__ERROR_DESCRIPTION__", &html_escape(&display_description))
+        .replace("__ERROR_HELP__", &html_escape(&help_text))
+        .into_bytes()
+}
+
+/// Escapes error strings before inserting them into HTML.
+fn html_escape(input: &str) -> String {
+    let mut escaped = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+/// Exchanges an authenticated ID token for an API-key style access token.
+pub(crate) async fn obtain_api_key(
+    issuer: &str,
+    client_id: &str,
+    id_token: &str,
+) -> io::Result<String> {
     // Token exchange for an API key access token
     #[derive(serde::Deserialize)]
     struct ExchangeResp {

@@ -7,7 +7,7 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 
 use codex_core::config::Config;
-use codex_core::protocol::Op;
+use codex_protocol::protocol::Op;
 use serde::Serialize;
 use serde_json::json;
 
@@ -136,12 +136,20 @@ pub(crate) fn log_inbound_app_event(event: &AppEvent) {
             });
             LOGGER.write_json_line(value);
         }
+        AppEvent::ClearUi => {
+            let value = json!({
+                "ts": now_ts(),
+                "dir": "to_tui",
+                "kind": "clear_ui",
+            });
+            LOGGER.write_json_line(value);
+        }
         AppEvent::InsertHistoryCell(cell) => {
             let value = json!({
                 "ts": now_ts(),
                 "dir": "to_tui",
                 "kind": "insert_history_cell",
-                "lines": cell.transcript_lines().len(),
+                "lines": cell.transcript_lines(u16::MAX).len(),
             });
             LOGGER.write_json_line(value);
         }

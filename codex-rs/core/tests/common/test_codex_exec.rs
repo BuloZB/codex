@@ -1,4 +1,5 @@
 #![allow(clippy::expect_used)]
+use codex_core::auth::CODEX_API_KEY_ENV_VAR;
 use std::path::Path;
 use tempfile::TempDir;
 use wiremock::MockServer;
@@ -10,11 +11,13 @@ pub struct TestCodexExecBuilder {
 
 impl TestCodexExecBuilder {
     pub fn cmd(&self) -> assert_cmd::Command {
-        let mut cmd = assert_cmd::Command::cargo_bin("codex-exec")
-            .expect("should find binary for codex-exec");
+        let mut cmd = assert_cmd::Command::new(
+            codex_utils_cargo_bin::cargo_bin("codex-exec")
+                .expect("should find binary for codex-exec"),
+        );
         cmd.current_dir(self.cwd.path())
             .env("CODEX_HOME", self.home.path())
-            .env("OPENAI_API_KEY", "dummy");
+            .env(CODEX_API_KEY_ENV_VAR, "dummy");
         cmd
     }
     pub fn cmd_with_server(&self, server: &MockServer) -> assert_cmd::Command {

@@ -1,7 +1,8 @@
 [package]
-edition = "2024"
 name = "codex-exec"
-version = { workspace = true }
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [[bin]]
 name = "codex-exec"
@@ -16,21 +17,21 @@ workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
-chrono = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 codex-arg0 = { workspace = true }
-codex-common = { workspace = true, features = [
-    "cli",
-    "elapsed",
-    "sandbox_summary",
-] }
+codex-cloud-requirements = { workspace = true }
 codex-core = { workspace = true }
-codex-ollama = { workspace = true }
 codex-protocol = { workspace = true }
+codex-utils-absolute-path = { workspace = true }
+codex-utils-cli = { workspace = true }
+codex-utils-elapsed = { workspace = true }
+codex-utils-oss = { workspace = true }
+codex-utils-sandbox-summary = { workspace = true }
 owo-colors = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 shlex = { workspace = true }
+supports-color = { workspace = true }
 tokio = { workspace = true, features = [
     "io-std",
     "macros",
@@ -45,13 +46,18 @@ ts-rs = { workspace = true, features = [
     "serde-json-impl",
     "no-serde-warnings",
 ] }
+uuid = { workspace = true }
+
 
 [dev-dependencies]
 assert_cmd = { workspace = true }
+codex-apply-patch = { workspace = true }
+codex-utils-cargo-bin = { workspace = true }
 core_test_support = { workspace = true }
 libc = { workspace = true }
 predicates = { workspace = true }
 pretty_assertions = { workspace = true }
+rmcp = { workspace = true }
 tempfile = { workspace = true }
 uuid = { workspace = true }
 walkdir = { workspace = true }
