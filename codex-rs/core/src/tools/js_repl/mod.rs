@@ -12,6 +12,7 @@ use codex_protocol::ThreadId;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
+use codex_protocol::models::ImageDetail;
 use codex_protocol::models::ResponseInputItem;
 use serde::Deserialize;
 use serde::Serialize;
@@ -35,6 +36,7 @@ use crate::codex::Session;
 use crate::codex::TurnContext;
 use crate::exec::ExecExpiration;
 use crate::exec_env::create_env;
+use crate::features::Feature;
 use crate::function_tool::FunctionCallError;
 use crate::sandboxing::CommandSpec;
 use crate::sandboxing::SandboxManager;
@@ -104,6 +106,7 @@ pub struct JsReplArgs {
 #[derive(Clone, Debug)]
 pub struct JsExecResult {
     pub output: String,
+    pub content_items: Vec<FunctionCallOutputContentItem>,
 }
 
 struct KernelState {
@@ -125,6 +128,7 @@ struct ExecContext {
 #[derive(Default)]
 struct ExecToolCalls {
     in_flight: usize,
+    content_items: Vec<FunctionCallOutputContentItem>,
     notify: Arc<Notify>,
     cancel: CancellationToken,
 }
@@ -136,6 +140,7 @@ enum JsReplToolCallPayloadKind {
     FunctionText,
     FunctionContentItems,
     CustomText,
+    CustomContentItems,
     McpResult,
     McpErrorResult,
     Error,
@@ -369,6 +374,17 @@ impl JsReplManager {
         Some(state.cancel.clone())
     }
 
+    async fn record_exec_content_item(
+        exec_tool_calls: &Arc<Mutex<HashMap<String, ExecToolCalls>>>,
+        exec_id: &str,
+        content_item: FunctionCallOutputContentItem,
+    ) {
+        let mut calls = exec_tool_calls.lock().await;
+        if let Some(state) = calls.get_mut(exec_id) {
+            state.content_items.push(content_item);
+        }
+    }
+
     async fn finish_exec_tool_call(
         exec_tool_calls: &Arc<Mutex<HashMap<String, ExecToolCalls>>>,
         exec_id: &str,
@@ -592,11 +608,18 @@ impl JsReplManager {
                     output,
                 )
             }
-            ResponseInputItem::CustomToolCallOutput { output, .. } => Self::summarize_text_payload(
-                Some("custom_tool_call_output"),
-                JsReplToolCallPayloadKind::CustomText,
-                output,
-            ),
+            ResponseInputItem::CustomToolCallOutput { output, .. } => {
+                let payload_kind = if output.content_items().is_some() {
+                    JsReplToolCallPayloadKind::CustomContentItems
+                } else {
+                    JsReplToolCallPayloadKind::CustomText
+                };
+                Self::summarize_function_output_payload(
+                    "custom_tool_call_output",
+                    payload_kind,
+                    output,
+                )
+            }
             ResponseInputItem::McpToolCallOutput { result, .. } => match result {
                 Ok(result) => {
                     let output = FunctionCallOutputPayload::from(result);
@@ -769,7 +792,13 @@ impl JsReplManager {
         };
 
         match response {
-            ExecResultMessage::Ok { output } => Ok(JsExecResult { output }),
+            ExecResultMessage::Ok { content_items } => {
+                let (output, content_items) = split_exec_result_content_items(content_items);
+                Ok(JsExecResult {
+                    output,
+                    content_items,
+                })
+            }
             ExecResultMessage::Err { message } => Err(FunctionCallError::RespondToModel(message)),
         }
     }
@@ -836,6 +865,8 @@ impl JsReplManager {
                 enforce_managed_network: has_managed_network_requirements,
                 network: None,
                 sandbox_policy_cwd: &turn.cwd,
+                #[cfg(target_os = "macos")]
+                macos_seatbelt_profile_extensions: None,
                 codex_linux_sandbox_exe: turn.codex_linux_sandbox_exe.as_ref(),
                 use_linux_sandbox_bwrap: turn
                     .features
@@ -1071,10 +1102,22 @@ impl JsReplManager {
                     error,
                 } => {
                     JsReplManager::wait_for_exec_tool_calls_map(&exec_tool_calls, &id).await;
+                    let content_items = {
+                        let calls = exec_tool_calls.lock().await;
+                        calls
+                            .get(&id)
+                            .map(|state| state.content_items.clone())
+                            .unwrap_or_default()
+                    };
                     let mut pending = pending_execs.lock().await;
                     if let Some(tx) = pending.remove(&id) {
                         let payload = if ok {
-                            ExecResultMessage::Ok { output }
+                            ExecResultMessage::Ok {
+                                content_items: build_exec_result_content_items(
+                                    output,
+                                    content_items,
+                                ),
+                            }
                         } else {
                             ExecResultMessage::Err {
                                 message: error
@@ -1085,6 +1128,49 @@ impl JsReplManager {
                     }
                     exec_contexts.lock().await.remove(&id);
                     JsReplManager::clear_exec_tool_calls_map(&exec_tool_calls, &id).await;
+                }
+                KernelToHost::EmitImage(req) => {
+                    let exec_id = req.exec_id.clone();
+                    let emit_id = req.id.clone();
+                    let response =
+                        if let Some(ctx) = exec_contexts.lock().await.get(&exec_id).cloned() {
+                            let content_item = emitted_image_content_item(
+                                ctx.turn.as_ref(),
+                                req.image_url,
+                                req.detail,
+                            );
+                            JsReplManager::record_exec_content_item(
+                                &exec_tool_calls,
+                                &exec_id,
+                                content_item,
+                            )
+                            .await;
+                            HostToKernel::EmitImageResult(EmitImageResult {
+                                id: emit_id,
+                                ok: true,
+                                error: None,
+                            })
+                        } else {
+                            HostToKernel::EmitImageResult(EmitImageResult {
+                                id: emit_id,
+                                ok: false,
+                                error: Some("js_repl exec context not found".to_string()),
+                            })
+                        };
+
+                    if let Err(err) = JsReplManager::write_message(&stdin, &response).await {
+                        let snapshot =
+                            JsReplManager::kernel_debug_snapshot(&child, &recent_stderr).await;
+                        warn!(
+                            exec_id = %exec_id,
+                            emit_id = %req.id,
+                            error = %err,
+                            kernel_pid = ?snapshot.pid,
+                            kernel_status = %snapshot.status,
+                            kernel_stderr_tail = %snapshot.stderr_tail,
+                            "failed to reply to kernel emit_image request"
+                        );
+                    }
                 }
                 KernelToHost::RunTool(req) => {
                     let Some(reset_cancel) =
@@ -1298,41 +1384,6 @@ impl JsReplManager {
             .await
         {
             Ok(response) => {
-                if let ResponseInputItem::FunctionCallOutput { output, .. } = &response
-                    && let Some(items) = output.content_items()
-                {
-                    let mut has_image = false;
-                    let mut content = Vec::with_capacity(items.len());
-                    for item in items {
-                        match item {
-                            FunctionCallOutputContentItem::InputText { text } => {
-                                content.push(ContentItem::InputText { text: text.clone() });
-                            }
-                            FunctionCallOutputContentItem::InputImage { image_url } => {
-                                has_image = true;
-                                content.push(ContentItem::InputImage {
-                                    image_url: image_url.clone(),
-                                });
-                            }
-                        }
-                    }
-
-                    if has_image
-                        && session
-                            .inject_response_items(vec![ResponseInputItem::Message {
-                                role: "user".to_string(),
-                                content,
-                            }])
-                            .await
-                            .is_err()
-                    {
-                        warn!(
-                            tool_name = %tool_name,
-                            "js_repl tool call returned image content but there was no active turn to attach it to"
-                        );
-                    }
-                }
-
                 let summary = Self::summarize_tool_call_response(&response);
                 match serde_json::to_value(response) {
                     Ok(value) => {
@@ -1405,6 +1456,49 @@ impl JsReplManager {
     }
 }
 
+fn emitted_image_content_item(
+    turn: &TurnContext,
+    image_url: String,
+    detail: Option<ImageDetail>,
+) -> FunctionCallOutputContentItem {
+    FunctionCallOutputContentItem::InputImage {
+        image_url,
+        detail: detail.or_else(|| default_output_image_detail_for_turn(turn)),
+    }
+}
+
+fn default_output_image_detail_for_turn(turn: &TurnContext) -> Option<ImageDetail> {
+    (turn.config.features.enabled(Feature::ImageDetailOriginal)
+        && turn.model_info.supports_image_detail_original)
+        .then_some(ImageDetail::Original)
+}
+
+fn build_exec_result_content_items(
+    output: String,
+    content_items: Vec<FunctionCallOutputContentItem>,
+) -> Vec<FunctionCallOutputContentItem> {
+    let mut all_content_items = Vec::with_capacity(content_items.len() + 1);
+    all_content_items.push(FunctionCallOutputContentItem::InputText { text: output });
+    all_content_items.extend(content_items);
+    all_content_items
+}
+
+fn split_exec_result_content_items(
+    mut content_items: Vec<FunctionCallOutputContentItem>,
+) -> (String, Vec<FunctionCallOutputContentItem>) {
+    match content_items.first() {
+        Some(FunctionCallOutputContentItem::InputText { .. }) => {
+            let FunctionCallOutputContentItem::InputText { text } = content_items.remove(0) else {
+                unreachable!("first content item should be input_text");
+            };
+            (text, content_items)
+        }
+        Some(FunctionCallOutputContentItem::InputImage { .. }) | None => {
+            (String::new(), content_items)
+        }
+    }
+}
+
 fn is_freeform_tool(specs: &[ToolSpec], name: &str) -> bool {
     specs
         .iter()
@@ -1426,6 +1520,7 @@ enum KernelToHost {
         error: Option<String>,
     },
     RunTool(RunToolRequest),
+    EmitImage(EmitImageRequest),
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1438,6 +1533,7 @@ enum HostToKernel {
         timeout_ms: Option<u64>,
     },
     RunToolResult(RunToolResult),
+    EmitImageResult(EmitImageResult),
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1458,10 +1554,31 @@ struct RunToolResult {
     error: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+struct EmitImageRequest {
+    id: String,
+    exec_id: String,
+    image_url: String,
+    #[serde(default)]
+    detail: Option<ImageDetail>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct EmitImageResult {
+    id: String,
+    ok: bool,
+    #[serde(default)]
+    error: Option<String>,
+}
+
 #[derive(Debug)]
 enum ExecResultMessage {
-    Ok { output: String },
-    Err { message: String },
+    Ok {
+        content_items: Vec<FunctionCallOutputContentItem>,
+    },
+    Err {
+        message: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1592,6 +1709,7 @@ mod tests {
     use super::*;
     use crate::codex::make_session_and_context;
     use crate::codex::make_session_and_context_with_dynamic_tools_and_rx;
+    use crate::features::Feature;
     use crate::protocol::AskForApproval;
     use crate::protocol::EventMsg;
     use crate::protocol::SandboxPolicy;
@@ -1599,9 +1717,9 @@ mod tests {
     use codex_protocol::dynamic_tools::DynamicToolCallOutputContentItem;
     use codex_protocol::dynamic_tools::DynamicToolResponse;
     use codex_protocol::dynamic_tools::DynamicToolSpec;
-    use codex_protocol::models::ContentItem;
     use codex_protocol::models::FunctionCallOutputContentItem;
     use codex_protocol::models::FunctionCallOutputPayload;
+    use codex_protocol::models::ImageDetail;
     use codex_protocol::models::ResponseInputItem;
     use codex_protocol::openai_models::InputModality;
     use pretty_assertions::assert_eq;
@@ -1826,6 +1944,7 @@ mod tests {
             output: FunctionCallOutputPayload::from_content_items(vec![
                 FunctionCallOutputContentItem::InputImage {
                     image_url: "data:image/png;base64,abcd".to_string(),
+                    detail: None,
                 },
             ]),
         };
@@ -1837,6 +1956,74 @@ mod tests {
             JsReplToolCallResponseSummary {
                 response_type: Some("function_call_output".to_string()),
                 payload_kind: Some(JsReplToolCallPayloadKind::FunctionContentItems),
+                payload_text_preview: None,
+                payload_text_length: None,
+                payload_item_count: Some(1),
+                text_item_count: Some(0),
+                image_item_count: Some(1),
+                structured_content_present: None,
+                result_is_error: None,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn emitted_image_content_item_preserves_explicit_detail() {
+        let (_session, turn) = make_session_and_context().await;
+        let content_item = emitted_image_content_item(
+            &turn,
+            "data:image/png;base64,AAA".to_string(),
+            Some(ImageDetail::Low),
+        );
+        assert_eq!(
+            content_item,
+            FunctionCallOutputContentItem::InputImage {
+                image_url: "data:image/png;base64,AAA".to_string(),
+                detail: Some(ImageDetail::Low),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn emitted_image_content_item_uses_turn_original_detail_when_enabled() {
+        let (_session, mut turn) = make_session_and_context().await;
+        Arc::make_mut(&mut turn.config)
+            .features
+            .enable(Feature::ImageDetailOriginal)
+            .expect("test config should allow feature update");
+        turn.model_info.supports_image_detail_original = true;
+
+        let content_item =
+            emitted_image_content_item(&turn, "data:image/png;base64,AAA".to_string(), None);
+
+        assert_eq!(
+            content_item,
+            FunctionCallOutputContentItem::InputImage {
+                image_url: "data:image/png;base64,AAA".to_string(),
+                detail: Some(ImageDetail::Original),
+            }
+        );
+    }
+
+    #[test]
+    fn summarize_tool_call_response_for_multimodal_custom_output() {
+        let response = ResponseInputItem::CustomToolCallOutput {
+            call_id: "call-1".to_string(),
+            output: FunctionCallOutputPayload::from_content_items(vec![
+                FunctionCallOutputContentItem::InputImage {
+                    image_url: "data:image/png;base64,abcd".to_string(),
+                    detail: None,
+                },
+            ]),
+        };
+
+        let actual = JsReplManager::summarize_tool_call_response(&response);
+
+        assert_eq!(
+            actual,
+            JsReplToolCallResponseSummary {
+                response_type: Some("custom_tool_call_output".to_string()),
+                payload_kind: Some(JsReplToolCallPayloadKind::CustomContentItems),
                 payload_text_preview: None,
                 payload_text_length: None,
                 payload_item_count: Some(1),
@@ -2256,7 +2443,7 @@ console.log("cell-complete");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn js_repl_can_attach_image_via_view_image_tool() -> anyhow::Result<()> {
+    async fn js_repl_does_not_auto_attach_image_via_view_image_tool() -> anyhow::Result<()> {
         if !can_run_js_repl_runtime_tests().await {
             return Ok(());
         }
@@ -2293,7 +2480,6 @@ const png = Buffer.from(
 await fs.writeFile(imagePath, png);
 const out = await codex.tool("view_image", { path: imagePath });
 console.log(out.type);
-console.log(out.output?.body?.text ?? "");
 "#;
 
         let result = manager
@@ -2308,26 +2494,443 @@ console.log(out.output?.body?.text ?? "");
             )
             .await?;
         assert!(result.output.contains("function_call_output"));
-
-        let pending_input = session.get_pending_input().await;
-        let [ResponseInputItem::Message { role, content }] = pending_input.as_slice() else {
-            panic!(
-                "view_image should inject exactly one pending input message, got {pending_input:?}"
-            );
-        };
-        assert_eq!(role, "user");
-        let [ContentItem::InputImage { image_url }] = content.as_slice() else {
-            panic!(
-                "view_image should inject exactly one input_image content item, got {content:?}"
-            );
-        };
-        assert!(image_url.starts_with("data:image/png;base64,"));
+        assert!(result.content_items.is_empty());
+        assert!(session.get_pending_input().await.is_empty());
 
         Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn js_repl_can_attach_image_via_dynamic_tool_with_mixed_content() -> anyhow::Result<()> {
+    async fn js_repl_can_emit_image_via_view_image_tool() -> anyhow::Result<()> {
+        if !can_run_js_repl_runtime_tests().await {
+            return Ok(());
+        }
+
+        let (session, mut turn) = make_session_and_context().await;
+        if !turn
+            .model_info
+            .input_modalities
+            .contains(&InputModality::Image)
+        {
+            return Ok(());
+        }
+        turn.approval_policy
+            .set(AskForApproval::Never)
+            .expect("test setup should allow updating approval policy");
+        turn.sandbox_policy
+            .set(SandboxPolicy::DangerFullAccess)
+            .expect("test setup should allow updating sandbox policy");
+
+        let session = Arc::new(session);
+        let turn = Arc::new(turn);
+        *session.active_turn.lock().await = Some(crate::state::ActiveTurn::default());
+
+        let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::default()));
+        let manager = turn.js_repl.manager().await?;
+        let code = r#"
+const fs = await import("node:fs/promises");
+const path = await import("node:path");
+const imagePath = path.join(codex.tmpDir, "js-repl-view-image-explicit.png");
+const png = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==",
+  "base64"
+);
+await fs.writeFile(imagePath, png);
+const out = await codex.tool("view_image", { path: imagePath });
+await codex.emitImage(out);
+console.log(out.type);
+"#;
+
+        let result = manager
+            .execute(
+                Arc::clone(&session),
+                turn,
+                tracker,
+                JsReplArgs {
+                    code: code.to_string(),
+                    timeout_ms: Some(15_000),
+                },
+            )
+            .await?;
+        assert!(result.output.contains("function_call_output"));
+        assert_eq!(
+            result.content_items.as_slice(),
+            [FunctionCallOutputContentItem::InputImage {
+                image_url:
+                    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=="
+                        .to_string(),
+                detail: None,
+            }]
+            .as_slice()
+        );
+        assert!(session.get_pending_input().await.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn js_repl_can_emit_image_from_bytes_and_mime_type() -> anyhow::Result<()> {
+        if !can_run_js_repl_runtime_tests().await {
+            return Ok(());
+        }
+
+        let (session, turn) = make_session_and_context().await;
+        if !turn
+            .model_info
+            .input_modalities
+            .contains(&InputModality::Image)
+        {
+            return Ok(());
+        }
+
+        let session = Arc::new(session);
+        let turn = Arc::new(turn);
+        *session.active_turn.lock().await = Some(crate::state::ActiveTurn::default());
+
+        let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::default()));
+        let manager = turn.js_repl.manager().await?;
+        let code = r#"
+const png = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==",
+  "base64"
+);
+await codex.emitImage({ bytes: png, mimeType: "image/png" });
+"#;
+
+        let result = manager
+            .execute(
+                Arc::clone(&session),
+                turn,
+                tracker,
+                JsReplArgs {
+                    code: code.to_string(),
+                    timeout_ms: Some(15_000),
+                },
+            )
+            .await?;
+        assert_eq!(
+            result.content_items.as_slice(),
+            [FunctionCallOutputContentItem::InputImage {
+                image_url:
+                    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=="
+                        .to_string(),
+                detail: None,
+            }]
+            .as_slice()
+        );
+        assert!(session.get_pending_input().await.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn js_repl_can_emit_multiple_images_in_one_cell() -> anyhow::Result<()> {
+        if !can_run_js_repl_runtime_tests().await {
+            return Ok(());
+        }
+
+        let (session, turn) = make_session_and_context().await;
+        if !turn
+            .model_info
+            .input_modalities
+            .contains(&InputModality::Image)
+        {
+            return Ok(());
+        }
+
+        let session = Arc::new(session);
+        let turn = Arc::new(turn);
+        *session.active_turn.lock().await = Some(crate::state::ActiveTurn::default());
+
+        let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::default()));
+        let manager = turn.js_repl.manager().await?;
+        let code = r#"
+await codex.emitImage(
+  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=="
+);
+await codex.emitImage(
+  "data:image/gif;base64,R0lGODdhAQABAIAAAP///////ywAAAAAAQABAAACAkQBADs="
+);
+"#;
+
+        let result = manager
+            .execute(
+                Arc::clone(&session),
+                turn,
+                tracker,
+                JsReplArgs {
+                    code: code.to_string(),
+                    timeout_ms: Some(15_000),
+                },
+            )
+            .await?;
+        assert_eq!(
+            result.content_items.as_slice(),
+            [
+                FunctionCallOutputContentItem::InputImage {
+                    image_url:
+                        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=="
+                            .to_string(),
+                    detail: None,
+                },
+                FunctionCallOutputContentItem::InputImage {
+                    image_url:
+                        "data:image/gif;base64,R0lGODdhAQABAIAAAP///////ywAAAAAAQABAAACAkQBADs="
+                            .to_string(),
+                    detail: None,
+                },
+            ]
+            .as_slice()
+        );
+        assert!(session.get_pending_input().await.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn js_repl_waits_for_unawaited_emit_image_before_completion() -> anyhow::Result<()> {
+        if !can_run_js_repl_runtime_tests().await {
+            return Ok(());
+        }
+
+        let (session, turn) = make_session_and_context().await;
+        if !turn
+            .model_info
+            .input_modalities
+            .contains(&InputModality::Image)
+        {
+            return Ok(());
+        }
+
+        let session = Arc::new(session);
+        let turn = Arc::new(turn);
+        *session.active_turn.lock().await = Some(crate::state::ActiveTurn::default());
+
+        let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::default()));
+        let manager = turn.js_repl.manager().await?;
+        let code = r#"
+void codex.emitImage(
+  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=="
+);
+console.log("cell-complete");
+"#;
+
+        let result = manager
+            .execute(
+                Arc::clone(&session),
+                turn,
+                tracker,
+                JsReplArgs {
+                    code: code.to_string(),
+                    timeout_ms: Some(15_000),
+                },
+            )
+            .await?;
+        assert!(result.output.contains("cell-complete"));
+        assert_eq!(
+            result.content_items.as_slice(),
+            [FunctionCallOutputContentItem::InputImage {
+                image_url:
+                    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=="
+                        .to_string(),
+                detail: None,
+            }]
+            .as_slice()
+        );
+        assert!(session.get_pending_input().await.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn js_repl_unawaited_emit_image_errors_fail_cell() -> anyhow::Result<()> {
+        if !can_run_js_repl_runtime_tests().await {
+            return Ok(());
+        }
+
+        let (session, turn) = make_session_and_context().await;
+        if !turn
+            .model_info
+            .input_modalities
+            .contains(&InputModality::Image)
+        {
+            return Ok(());
+        }
+
+        let session = Arc::new(session);
+        let turn = Arc::new(turn);
+        *session.active_turn.lock().await = Some(crate::state::ActiveTurn::default());
+
+        let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::default()));
+        let manager = turn.js_repl.manager().await?;
+        let code = r#"
+void codex.emitImage({ bytes: new Uint8Array(), mimeType: "image/png" });
+console.log("cell-complete");
+"#;
+
+        let err = manager
+            .execute(
+                Arc::clone(&session),
+                turn,
+                tracker,
+                JsReplArgs {
+                    code: code.to_string(),
+                    timeout_ms: Some(15_000),
+                },
+            )
+            .await
+            .expect_err("unawaited invalid emitImage should fail");
+        assert!(err.to_string().contains("expected non-empty bytes"));
+        assert!(session.get_pending_input().await.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn js_repl_caught_emit_image_error_does_not_fail_cell() -> anyhow::Result<()> {
+        if !can_run_js_repl_runtime_tests().await {
+            return Ok(());
+        }
+
+        let (session, turn) = make_session_and_context().await;
+        if !turn
+            .model_info
+            .input_modalities
+            .contains(&InputModality::Image)
+        {
+            return Ok(());
+        }
+
+        let session = Arc::new(session);
+        let turn = Arc::new(turn);
+        *session.active_turn.lock().await = Some(crate::state::ActiveTurn::default());
+
+        let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::default()));
+        let manager = turn.js_repl.manager().await?;
+        let code = r#"
+try {
+  await codex.emitImage({ bytes: new Uint8Array(), mimeType: "image/png" });
+} catch (error) {
+  console.log(error.message);
+}
+console.log("cell-complete");
+"#;
+
+        let result = manager
+            .execute(
+                Arc::clone(&session),
+                turn,
+                tracker,
+                JsReplArgs {
+                    code: code.to_string(),
+                    timeout_ms: Some(15_000),
+                },
+            )
+            .await?;
+        assert!(result.output.contains("expected non-empty bytes"));
+        assert!(result.output.contains("cell-complete"));
+        assert!(result.content_items.is_empty());
+        assert!(session.get_pending_input().await.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn js_repl_emit_image_requires_explicit_mime_type_for_bytes() -> anyhow::Result<()> {
+        if !can_run_js_repl_runtime_tests().await {
+            return Ok(());
+        }
+
+        let (session, turn) = make_session_and_context().await;
+        if !turn
+            .model_info
+            .input_modalities
+            .contains(&InputModality::Image)
+        {
+            return Ok(());
+        }
+
+        let session = Arc::new(session);
+        let turn = Arc::new(turn);
+        *session.active_turn.lock().await = Some(crate::state::ActiveTurn::default());
+
+        let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::default()));
+        let manager = turn.js_repl.manager().await?;
+        let code = r#"
+const png = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==",
+  "base64"
+);
+await codex.emitImage({ bytes: png });
+"#;
+
+        let err = manager
+            .execute(
+                Arc::clone(&session),
+                turn,
+                tracker,
+                JsReplArgs {
+                    code: code.to_string(),
+                    timeout_ms: Some(15_000),
+                },
+            )
+            .await
+            .expect_err("missing mimeType should fail");
+        assert!(err.to_string().contains("expected a non-empty mimeType"));
+        assert!(session.get_pending_input().await.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn js_repl_emit_image_rejects_invalid_detail() -> anyhow::Result<()> {
+        if !can_run_js_repl_runtime_tests().await {
+            return Ok(());
+        }
+
+        let (session, turn) = make_session_and_context().await;
+        if !turn
+            .model_info
+            .input_modalities
+            .contains(&InputModality::Image)
+        {
+            return Ok(());
+        }
+
+        let session = Arc::new(session);
+        let turn = Arc::new(turn);
+        *session.active_turn.lock().await = Some(crate::state::ActiveTurn::default());
+
+        let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::default()));
+        let manager = turn.js_repl.manager().await?;
+        let code = r#"
+const png = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==",
+  "base64"
+);
+await codex.emitImage({ bytes: png, mimeType: "image/png", detail: "ultra" });
+"#;
+
+        let err = manager
+            .execute(
+                Arc::clone(&session),
+                turn,
+                tracker,
+                JsReplArgs {
+                    code: code.to_string(),
+                    timeout_ms: Some(15_000),
+                },
+            )
+            .await
+            .expect_err("invalid detail should fail");
+        assert!(err.to_string().contains("expected detail to be one of"));
+        assert!(session.get_pending_input().await.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn js_repl_emit_image_rejects_mixed_content() -> anyhow::Result<()> {
         if !can_run_js_repl_runtime_tests().await {
             return Ok(());
         }
@@ -2357,7 +2960,7 @@ console.log(out.output?.body?.text ?? "");
         let manager = turn.js_repl.manager().await?;
         let code = r#"
 const out = await codex.tool("inline_image", {});
-console.log(out.type);
+await codex.emitImage(out);
 "#;
         let image_url = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
 
@@ -2400,24 +3003,12 @@ console.log(out.type);
             response_watcher,
         );
         response_watcher_result?;
-        let result = result?;
-        assert!(result.output.contains("function_call_output"));
-
-        let pending_input = session.get_pending_input().await;
-        assert_eq!(
-            pending_input,
-            vec![ResponseInputItem::Message {
-                role: "user".to_string(),
-                content: vec![
-                    ContentItem::InputText {
-                        text: "inline image note".to_string(),
-                    },
-                    ContentItem::InputImage {
-                        image_url: image_url.to_string(),
-                    },
-                ],
-            }]
+        let err = result.expect_err("mixed content should fail");
+        assert!(
+            err.to_string()
+                .contains("does not accept mixed text and image content")
         );
+        assert!(session.get_pending_input().await.is_empty());
 
         Ok(())
     }
