@@ -235,6 +235,7 @@ async fn rate_limit_snapshot_keeps_prior_credits_when_missing_from_headers() {
             balance: Some("17.5".to_string()),
         }),
         plan_type: None,
+        rate_limit_reached_type: None,
     }));
     let initial_balance = chat
         .rate_limit_snapshots_by_limit_id
@@ -254,6 +255,7 @@ async fn rate_limit_snapshot_keeps_prior_credits_when_missing_from_headers() {
         secondary: None,
         credits: None,
         plan_type: None,
+        rate_limit_reached_type: None,
     }));
 
     let display = chat
@@ -292,6 +294,7 @@ async fn rate_limit_snapshot_updates_and_retains_plan_type() {
         }),
         credits: None,
         plan_type: Some(PlanType::Plus),
+        rate_limit_reached_type: None,
     }));
     assert_eq!(chat.plan_type, Some(PlanType::Plus));
 
@@ -310,6 +313,7 @@ async fn rate_limit_snapshot_updates_and_retains_plan_type() {
         }),
         credits: None,
         plan_type: Some(PlanType::Pro),
+        rate_limit_reached_type: None,
     }));
     assert_eq!(chat.plan_type, Some(PlanType::Pro));
 
@@ -328,6 +332,7 @@ async fn rate_limit_snapshot_updates_and_retains_plan_type() {
         }),
         credits: None,
         plan_type: None,
+        rate_limit_reached_type: None,
     }));
     assert_eq!(chat.plan_type, Some(PlanType::Pro));
 }
@@ -351,6 +356,7 @@ async fn rate_limit_snapshots_keep_separate_entries_per_limit_id() {
             balance: Some("5.00".to_string()),
         }),
         plan_type: Some(PlanType::Pro),
+        rate_limit_reached_type: None,
     }));
 
     chat.on_rate_limit_snapshot(Some(RateLimitSnapshot {
@@ -364,6 +370,7 @@ async fn rate_limit_snapshots_keep_separate_entries_per_limit_id() {
         secondary: None,
         credits: None,
         plan_type: Some(PlanType::Pro),
+        rate_limit_reached_type: None,
     }));
 
     let codex = chat
@@ -416,6 +423,7 @@ async fn rate_limit_switch_prompt_skips_non_codex_limit() {
         secondary: None,
         credits: None,
         plan_type: None,
+        rate_limit_reached_type: None,
     }));
 
     assert!(matches!(
@@ -694,7 +702,7 @@ async fn status_widget_and_approval_modal_snapshot() {
         approval_id: Some("call-approve-exec".into()),
         turn_id: "turn-approve-exec".into(),
         command: vec!["echo".into(), "hello world".into()],
-        cwd: PathBuf::from("/tmp"),
+        cwd: test_path_buf("/tmp").abs(),
         reason: Some(
             "this is a test reason such as one that would be produced by the model".into(),
         ),
@@ -867,32 +875,50 @@ async fn status_line_invalid_items_warn_once() {
 }
 
 #[tokio::test]
-async fn status_line_legacy_context_used_renders_context_meter() {
+async fn status_line_context_used_renders_labeled_percent() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.thread_id = Some(ThreadId::new());
     chat.config.tui_status_line = Some(vec!["context-used".to_string()]);
 
     chat.refresh_status_line();
 
-    assert_eq!(status_line_text(&chat), Some("Context [     ]".to_string()));
+    assert_eq!(status_line_text(&chat), Some("Context 0% used".to_string()));
     assert!(
         drain_insert_history(&mut rx).is_empty(),
-        "legacy context-used should remain a valid status line item"
+        "context-used should remain a valid status line item"
     );
 }
 
 #[tokio::test]
-async fn status_line_legacy_context_remaining_renders_context_meter() {
+async fn status_line_context_remaining_renders_labeled_percent() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.thread_id = Some(ThreadId::new());
     chat.config.tui_status_line = Some(vec!["context-remaining".to_string()]);
 
     chat.refresh_status_line();
 
-    assert_eq!(status_line_text(&chat), Some("Context [     ]".to_string()));
+    assert_eq!(
+        status_line_text(&chat),
+        Some("Context 100% left".to_string())
+    );
     assert!(
         drain_insert_history(&mut rx).is_empty(),
-        "legacy context-remaining should remain a valid status line item"
+        "context-remaining should remain a valid status line item"
+    );
+}
+
+#[tokio::test]
+async fn status_line_legacy_context_usage_renders_context_used_percent() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.thread_id = Some(ThreadId::new());
+    chat.config.tui_status_line = Some(vec!["context-usage".to_string()]);
+
+    chat.refresh_status_line();
+
+    assert_eq!(status_line_text(&chat), Some("Context 0% used".to_string()));
+    assert!(
+        drain_insert_history(&mut rx).is_empty(),
+        "legacy context-usage should remain a valid status line item"
     );
 }
 
@@ -995,7 +1021,7 @@ async fn status_line_model_with_reasoning_includes_fast_for_fast_capable_models(
     chat.config.cwd = test_project_path().abs();
     chat.config.tui_status_line = Some(vec![
         "model-with-reasoning".to_string(),
-        "context-usage".to_string(),
+        "context-used".to_string(),
         "current-dir".to_string(),
     ]);
     chat.set_reasoning_effort(Some(ReasoningEffortConfig::XHigh));
@@ -1008,7 +1034,7 @@ async fn status_line_model_with_reasoning_includes_fast_for_fast_capable_models(
 
     assert_eq!(
         status_line_text(&chat),
-        Some(format!("gpt-5.4 xhigh fast · Context [     ] · {test_cwd}"))
+        Some(format!("gpt-5.4 xhigh fast · Context 0% used · {test_cwd}"))
     );
 
     chat.set_model("gpt-5.3-codex");
@@ -1017,7 +1043,7 @@ async fn status_line_model_with_reasoning_includes_fast_for_fast_capable_models(
     assert_eq!(
         status_line_text(&chat),
         Some(format!(
-            "gpt-5.3-codex xhigh · Context [     ] · {test_cwd}"
+            "gpt-5.3-codex xhigh · Context 0% used · {test_cwd}"
         ))
     );
 }
@@ -1141,7 +1167,7 @@ async fn status_line_model_with_reasoning_fast_footer_snapshot() {
     chat.config.cwd = test_project_path().abs();
     chat.config.tui_status_line = Some(vec![
         "model-with-reasoning".to_string(),
-        "context-usage".to_string(),
+        "context-used".to_string(),
         "current-dir".to_string(),
     ]);
     chat.set_reasoning_effort(Some(ReasoningEffortConfig::XHigh));
@@ -1159,6 +1185,40 @@ async fn status_line_model_with_reasoning_fast_footer_snapshot() {
         .expect("draw model-with-reasoning footer");
     assert_chatwidget_snapshot!(
         "status_line_model_with_reasoning_fast_footer",
+        normalized_backend_snapshot(terminal.backend())
+    );
+}
+
+#[tokio::test]
+async fn status_line_model_with_reasoning_context_remaining_footer_snapshot() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(Some("gpt-5.4")).await;
+    set_fast_mode_test_catalog(&mut chat);
+    assert!(get_available_model(&chat, "gpt-5.4").supports_fast_mode());
+    chat.show_welcome_banner = false;
+    chat.config.cwd = test_project_path().abs();
+    chat.config.tui_status_line = Some(vec![
+        "model-with-reasoning".to_string(),
+        "context-remaining".to_string(),
+        "current-dir".to_string(),
+    ]);
+    chat.set_reasoning_effort(Some(ReasoningEffortConfig::XHigh));
+    chat.set_service_tier(Some(ServiceTier::Fast));
+    set_chatgpt_auth(&mut chat);
+    set_fast_mode_test_catalog(&mut chat);
+    assert!(get_available_model(&chat, "gpt-5.4").supports_fast_mode());
+    chat.refresh_status_line();
+
+    let width = 80;
+    let height = chat.desired_height(width);
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("create terminal");
+    terminal
+        .draw(|f| chat.render(f.area(), f.buffer_mut()))
+        .expect("draw model-with-reasoning footer");
+    assert_chatwidget_snapshot!(
+        "status_line_model_with_reasoning_context_remaining_footer",
         normalized_backend_snapshot(terminal.backend())
     );
 }
@@ -1372,7 +1432,8 @@ async fn user_prompt_submit_app_server_hook_notifications_render_snapshot() {
                 handler_type: AppServerHookHandlerType::Command,
                 execution_mode: AppServerHookExecutionMode::Sync,
                 scope: AppServerHookScope::Turn,
-                source_path: PathBuf::from("/tmp/hooks.json"),
+                source_path: PathBuf::from(test_path_display("/tmp/hooks.json")).abs(),
+                source: codex_app_server_protocol::HookSource::User,
                 display_order: 0,
                 status: AppServerHookRunStatus::Running,
                 status_message: Some("checking go-workflow input policy".to_string()),
@@ -1394,7 +1455,8 @@ async fn user_prompt_submit_app_server_hook_notifications_render_snapshot() {
                 handler_type: AppServerHookHandlerType::Command,
                 execution_mode: AppServerHookExecutionMode::Sync,
                 scope: AppServerHookScope::Turn,
-                source_path: PathBuf::from("/tmp/hooks.json"),
+                source_path: PathBuf::from(test_path_display("/tmp/hooks.json")).abs(),
+                source: codex_app_server_protocol::HookSource::User,
                 display_order: 0,
                 status: AppServerHookRunStatus::Stopped,
                 status_message: Some("checking go-workflow input policy".to_string()),
@@ -1464,7 +1526,8 @@ async fn completed_hook_with_no_entries_stays_out_of_history() {
                 handler_type: codex_protocol::protocol::HookHandlerType::Command,
                 execution_mode: codex_protocol::protocol::HookExecutionMode::Sync,
                 scope: codex_protocol::protocol::HookScope::Turn,
-                source_path: PathBuf::from("/tmp/hooks.json"),
+                source_path: PathBuf::from(test_path_display("/tmp/hooks.json")).abs(),
+                source: codex_protocol::protocol::HookSource::User,
                 display_order: 0,
                 status: codex_protocol::protocol::HookRunStatus::Running,
                 status_message: None,
@@ -1489,7 +1552,8 @@ async fn completed_hook_with_no_entries_stays_out_of_history() {
                 handler_type: codex_protocol::protocol::HookHandlerType::Command,
                 execution_mode: codex_protocol::protocol::HookExecutionMode::Sync,
                 scope: codex_protocol::protocol::HookScope::Turn,
-                source_path: PathBuf::from("/tmp/hooks.json"),
+                source_path: PathBuf::from(test_path_display("/tmp/hooks.json")).abs(),
+                source: codex_protocol::protocol::HookSource::User,
                 display_order: 0,
                 status: codex_protocol::protocol::HookRunStatus::Completed,
                 status_message: None,
@@ -1964,7 +2028,8 @@ fn hook_run_summary(
         handler_type: codex_protocol::protocol::HookHandlerType::Command,
         execution_mode: codex_protocol::protocol::HookExecutionMode::Sync,
         scope: codex_protocol::protocol::HookScope::Turn,
-        source_path: PathBuf::from("/tmp/hooks.json"),
+        source_path: PathBuf::from(test_path_display("/tmp/hooks.json")).abs(),
+        source: codex_protocol::protocol::HookSource::User,
         display_order: 0,
         status,
         status_message: status_message.map(str::to_string),
@@ -2013,7 +2078,7 @@ async fn chatwidget_exec_and_status_layout_vt100_snapshot() {
             path: "diff_render.rs".into(),
         },
     ];
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let cwd = AbsolutePathBuf::current_dir().expect("current dir");
     chat.handle_codex_event(Event {
         id: "c1".into(),
         msg: EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
