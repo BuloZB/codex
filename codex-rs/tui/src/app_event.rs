@@ -10,14 +10,18 @@
 
 use std::path::PathBuf;
 
+use codex_app_server_protocol::AddCreditsNudgeCreditType;
+use codex_app_server_protocol::AddCreditsNudgeEmailStatus;
 use codex_app_server_protocol::AppInfo;
 use codex_app_server_protocol::McpServerStatus;
+use codex_app_server_protocol::McpServerStatusDetail;
 use codex_app_server_protocol::PluginInstallResponse;
 use codex_app_server_protocol::PluginListResponse;
 use codex_app_server_protocol::PluginReadParams;
 use codex_app_server_protocol::PluginReadResponse;
 use codex_app_server_protocol::PluginUninstallResponse;
 use codex_app_server_protocol::SkillsListResponse;
+use codex_app_server_protocol::ThreadGoalStatus;
 use codex_file_search::FileMatch;
 use codex_protocol::ThreadId;
 use codex_protocol::openai_models::ModelPreset;
@@ -30,11 +34,10 @@ use codex_utils_approval_presets::ApprovalPreset;
 use crate::bottom_pane::ApprovalRequest;
 use crate::bottom_pane::StatusLineItem;
 use crate::bottom_pane::TerminalTitleItem;
-use crate::history_cell::HistoryCell;
-use crate::legacy_core::plugins::PluginCapabilitySummary;
-
+use crate::chatwidget::UserMessage;
 use codex_config::types::ApprovalsReviewer;
 use codex_features::Feature;
+use codex_plugin::PluginCapabilitySummary;
 use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ServiceTier;
@@ -44,10 +47,18 @@ use codex_protocol::protocol::SandboxPolicy;
 use codex_realtime_webrtc::RealtimeWebrtcEvent;
 use codex_realtime_webrtc::RealtimeWebrtcSessionHandle;
 
+use crate::history_cell::HistoryCell;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RealtimeAudioDeviceKind {
     Microphone,
     Speaker,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ThreadGoalSetMode {
+    ConfirmIfExists,
+    ReplaceExisting,
 }
 
 impl RealtimeAudioDeviceKind {
@@ -103,6 +114,12 @@ pub(crate) enum AppEvent {
     OpenAgentPicker,
     /// Switch the active thread to the selected agent.
     SelectAgentThread(ThreadId),
+
+    /// Fork the current thread into a transient side conversation.
+    StartSide {
+        parent_thread_id: ThreadId,
+        user_message: Option<UserMessage>,
+    },
 
     /// Submit an op to the specified thread, regardless of current focus.
     SubmitThreadOp {
@@ -177,10 +194,43 @@ pub(crate) enum AppEvent {
         origin: RateLimitRefreshOrigin,
     },
 
+    /// Open the current thread goal summary/action menu.
+    OpenThreadGoalMenu {
+        thread_id: ThreadId,
+    },
+
+    /// Set or replace the current thread goal objective.
+    SetThreadGoalObjective {
+        thread_id: ThreadId,
+        objective: String,
+        mode: ThreadGoalSetMode,
+    },
+
+    /// Pause or unpause the current thread goal.
+    SetThreadGoalStatus {
+        thread_id: ThreadId,
+        status: ThreadGoalStatus,
+    },
+
+    /// Clear the current thread goal.
+    ClearThreadGoal {
+        thread_id: ThreadId,
+    },
+
     /// Result of refreshing rate limits.
     RateLimitsLoaded {
         origin: RateLimitRefreshOrigin,
         result: Result<Vec<RateLimitSnapshot>, String>,
+    },
+
+    /// Send a user-confirmed request to notify the workspace owner.
+    SendAddCreditsNudgeEmail {
+        credit_type: AddCreditsNudgeCreditType,
+    },
+
+    /// Result of notifying the workspace owner.
+    AddCreditsNudgeEmailFinished {
+        result: Result<AddCreditsNudgeEmailStatus, String>,
     },
 
     /// Result of prefetching connectors.
@@ -315,11 +365,14 @@ pub(crate) enum AppEvent {
     PluginInstallAuthAbandon,
 
     /// Fetch MCP inventory via app-server RPCs and render it into history.
-    FetchMcpInventory,
+    FetchMcpInventory {
+        detail: McpServerStatusDetail,
+    },
 
     /// Result of fetching MCP inventory via app-server RPCs.
     McpInventoryLoaded {
         result: Result<Vec<McpServerStatus>, String>,
+        detail: McpServerStatusDetail,
     },
 
     /// Result of the startup skills refresh that runs after the first frame is scheduled.
