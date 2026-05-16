@@ -26,6 +26,8 @@ use crate::tools::handlers::view_image_spec::ViewImageToolOptions;
 use crate::tools::handlers::view_image_spec::create_view_image_tool;
 use crate::tools::registry::ToolRegistry;
 use codex_app_server_protocol::AppInfo;
+use codex_extension_api::ToolCall as ExtensionToolCall;
+use codex_extension_api::ToolExecutor;
 use codex_features::Feature;
 use codex_features::Features;
 use codex_mcp::ToolInfo;
@@ -41,10 +43,6 @@ use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::WebSearchToolType;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
-use codex_tool_api::FunctionToolSpec;
-use codex_tool_api::ToolBundle as ExtensionToolBundle;
-use codex_tool_api::ToolExecutor;
-use codex_tool_api::ToolFuture;
 use codex_tools::AdditionalProperties;
 use codex_tools::DiscoverablePluginInfo;
 use codex_tools::DiscoverableTool;
@@ -67,6 +65,7 @@ use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 const CODEX_APPS_MCP_SERVER_NAME: &str = "codex_apps";
 const DEFAULT_AGENT_TYPE_DESCRIPTION: &str = "Test agent type description.";
@@ -74,32 +73,51 @@ const DEFAULT_WAIT_TIMEOUT_MS: i64 = 30_000;
 const MIN_WAIT_TIMEOUT_MS: i64 = 10_000;
 const MAX_WAIT_TIMEOUT_MS: i64 = 3_600_000;
 
-struct UnusedExtensionExecutor;
-
-impl ToolExecutor for UnusedExtensionExecutor {
-    fn execute<'a>(&'a self, _call: codex_tool_api::ToolCall) -> ToolFuture<'a> {
-        Box::pin(async { panic!("spec planning should not execute extension tools") })
+fn extension_tool_executor(
+    name: &str,
+    description: &str,
+) -> Arc<dyn ToolExecutor<ExtensionToolCall>> {
+    struct SpecOnlyExtensionExecutor {
+        name: String,
+        description: String,
     }
-}
 
-fn extension_tool_bundle(name: &str, description: &str) -> ExtensionToolBundle {
-    ExtensionToolBundle::new(
-        FunctionToolSpec {
-            name: name.to_string(),
-            description: description.to_string(),
-            strict: true,
-            parameters: serde_json::to_value(JsonSchema::object(
-                BTreeMap::from([(
-                    "message".to_string(),
-                    JsonSchema::string(/*description*/ None),
-                )]),
-                Some(vec!["message".to_string()]),
-                Some(false.into()),
-            ))
-            .expect("extension schema should serialize"),
-        },
-        std::sync::Arc::new(UnusedExtensionExecutor),
-    )
+    #[async_trait::async_trait]
+    impl ToolExecutor<ExtensionToolCall> for SpecOnlyExtensionExecutor {
+        fn tool_name(&self) -> ToolName {
+            ToolName::plain(self.name.as_str())
+        }
+
+        fn spec(&self) -> Option<ToolSpec> {
+            Some(ToolSpec::Function(ResponsesApiTool {
+                name: self.name.clone(),
+                description: self.description.clone(),
+                strict: true,
+                parameters: JsonSchema::object(
+                    BTreeMap::from([(
+                        "message".to_string(),
+                        JsonSchema::string(/*description*/ None),
+                    )]),
+                    Some(vec!["message".to_string()]),
+                    Some(false.into()),
+                ),
+                output_schema: None,
+                defer_loading: None,
+            }))
+        }
+
+        async fn handle(
+            &self,
+            _call: ExtensionToolCall,
+        ) -> Result<Box<dyn codex_tools::ToolOutput>, codex_tools::FunctionCallError> {
+            panic!("spec planning should not execute extension tools")
+        }
+    }
+
+    Arc::new(SpecOnlyExtensionExecutor {
+        name: name.to_string(),
+        description: description.to_string(),
+    })
 }
 
 #[test]
@@ -116,16 +134,16 @@ fn extension_tools_do_not_replace_builtin_tools() {
         permission_profile: &PermissionProfile::Disabled,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
-    let extension_tool_bundles = vec![extension_tool_bundle(
+    let extension_tool_executors = vec![extension_tool_executor(
         "update_plan",
         "Extension attempt to replace a built-in tool.",
     )];
-    let (tools, _) = build_specs_with_discoverable_tools(
+    let (tools, _) = build_specs_with_inputs_for_test(
         &tools_config,
         /*mcp_tools*/ None,
         /*deferred_mcp_tools*/ None,
         /*discoverable_tools*/ None,
-        &extension_tool_bundles,
+        &extension_tool_executors,
         &[],
     );
 
@@ -693,13 +711,14 @@ fn view_image_tool_includes_detail_with_original_detail_support() {
     };
     let (properties, _) = expect_object_schema(parameters);
     assert!(properties.contains_key("detail"));
-    let description = expect_string_description(
-        properties
-            .get("detail")
-            .expect("view_image detail should include a description"),
-    );
-    assert!(description.contains("only supported value is `original`"));
-    assert!(description.contains("omit this field for default resized behavior"));
+    let detail_schema = properties
+        .get("detail")
+        .expect("view_image detail should include a description");
+    let description = expect_string_description(detail_schema);
+    let expected = vec![json!("high"), json!("original")];
+    assert_eq!(detail_schema.enum_values.as_ref(), Some(&expected));
+    assert!(description.contains("Supported values are `high` and `original`"));
+    assert!(description.contains("omit this field for default high resized behavior"));
 }
 
 #[test]
@@ -1422,7 +1441,7 @@ fn namespace_specs_are_hidden_when_namespace_tools_are_disabled() {
     );
 
     assert_lacks_tool_name(&tools, "mcp__sample__");
-    assert!(registry.has_handler(&ToolName::namespaced("mcp__sample__", "echo")));
+    assert!(registry.has_tool(&ToolName::namespaced("mcp__sample__", "echo")));
 }
 
 #[test]
@@ -1628,11 +1647,11 @@ fn search_tool_description_lists_each_mcp_source_once() {
     assert!(description.contains("- rmcp: Remote memory tools."));
     assert!(!description.contains("mcp__rmcp__echo"));
 
-    assert!(registry.has_handler(&ToolName::namespaced(
+    assert!(registry.has_tool(&ToolName::namespaced(
         "mcp__codex_apps__calendar",
         "_create_event",
     )));
-    assert!(registry.has_handler(&ToolName::namespaced("mcp__rmcp__", "echo")));
+    assert!(registry.has_tool(&ToolName::namespaced("mcp__rmcp__", "echo")));
 }
 
 #[test]
@@ -1740,7 +1759,7 @@ fn no_search_tool_when_namespaces_disabled() {
     );
 
     assert_lacks_tool_name(&tools, TOOL_SEARCH_TOOL_NAME);
-    assert!(!registry.has_handler(&ToolName::plain(TOOL_SEARCH_TOOL_NAME)));
+    assert!(!registry.has_tool(&ToolName::plain(TOOL_SEARCH_TOOL_NAME)));
 }
 
 #[test]
@@ -1798,9 +1817,9 @@ fn search_tool_registers_for_deferred_dynamic_tools() {
     assert!(description.contains("- Dynamic tools: Tools provided by the current Codex thread."));
     assert_contains_tool_names(&tools, &[TOOL_SEARCH_TOOL_NAME]);
     assert_lacks_tool_name(&tools, "codex_app");
-    assert!(registry.has_handler(&ToolName::plain(TOOL_SEARCH_TOOL_NAME)));
-    assert!(registry.has_handler(&ToolName::namespaced("codex_app", "automation_update")));
-    assert!(registry.has_handler(&ToolName::namespaced("codex_app", "automation_list")));
+    assert!(registry.has_tool(&ToolName::plain(TOOL_SEARCH_TOOL_NAME)));
+    assert!(registry.has_tool(&ToolName::namespaced("codex_app", "automation_update")));
+    assert!(registry.has_tool(&ToolName::namespaced("codex_app", "automation_list")));
 }
 
 #[test]
@@ -1847,9 +1866,9 @@ fn search_tool_is_hidden_for_deferred_dynamic_tools_when_namespace_tools_are_dis
     assert_lacks_tool_name(&tools, TOOL_SEARCH_TOOL_NAME);
     assert_lacks_tool_name(&tools, "codex_app");
     assert_lacks_tool_name(&tools, "plain_dynamic");
-    assert!(!registry.has_handler(&ToolName::plain(TOOL_SEARCH_TOOL_NAME)));
-    assert!(registry.has_handler(&ToolName::namespaced("codex_app", "automation_update")));
-    assert!(registry.has_handler(&ToolName::plain("plain_dynamic")));
+    assert!(!registry.has_tool(&ToolName::plain(TOOL_SEARCH_TOOL_NAME)));
+    assert!(registry.has_tool(&ToolName::namespaced("codex_app", "automation_update")));
+    assert!(registry.has_tool(&ToolName::plain("plain_dynamic")));
 }
 
 #[test]
@@ -1871,7 +1890,7 @@ fn request_plugin_install_is_not_registered_without_feature_flag() {
         permission_profile: &PermissionProfile::Disabled,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
-    let (tools, _) = build_specs_with_discoverable_tools(
+    let (tools, _) = build_specs_with_inputs_for_test(
         &tools_config,
         /*mcp_tools*/ None,
         /*deferred_mcp_tools*/ None,
@@ -1880,7 +1899,7 @@ fn request_plugin_install_is_not_registered_without_feature_flag() {
             "Google Calendar",
             "Plan events and schedules.",
         )]),
-        /*extension_tool_bundles*/ &[],
+        /*extension_tool_executors*/ &[],
         &[],
     );
 
@@ -1912,7 +1931,7 @@ fn request_plugin_install_can_be_registered_without_search_tool() {
         permission_profile: &PermissionProfile::Disabled,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
-    let (tools, _) = build_specs_with_discoverable_tools(
+    let (tools, _) = build_specs_with_inputs_for_test(
         &tools_config,
         /*mcp_tools*/ None,
         /*deferred_mcp_tools*/ None,
@@ -1921,7 +1940,7 @@ fn request_plugin_install_can_be_registered_without_search_tool() {
             "Google Calendar",
             "Plan events and schedules.",
         )]),
-        /*extension_tool_bundles*/ &[],
+        /*extension_tool_executors*/ &[],
         &[],
     );
 
@@ -1981,15 +2000,15 @@ fn request_plugin_install_description_lists_discoverable_tools() {
         })),
     ];
 
-    let (tools, registry) = build_specs_with_discoverable_tools(
+    let (tools, registry) = build_specs_with_inputs_for_test(
         &tools_config,
         /*mcp_tools*/ None,
         /*deferred_mcp_tools*/ None,
         Some(discoverable_tools),
-        /*extension_tool_bundles*/ &[],
+        /*extension_tool_executors*/ &[],
         &[],
     );
-    assert!(registry.has_handler(&ToolName::plain(REQUEST_PLUGIN_INSTALL_TOOL_NAME)));
+    assert!(registry.has_tool(&ToolName::plain(REQUEST_PLUGIN_INSTALL_TOOL_NAME)));
 
     let request_plugin_install = find_tool(&tools, REQUEST_PLUGIN_INSTALL_TOOL_NAME);
     let ToolSpec::Function(ResponsesApiTool {
@@ -2091,18 +2110,19 @@ fn code_mode_augments_mcp_tool_descriptions_with_namespaced_sample() {
         &[],
     );
 
-    let ResponsesApiTool { description, .. } =
-        find_namespace_function_tool(&tools, "mcp__sample__", "echo");
+    let ToolSpec::Freeform(FreeformTool { description, .. }) = find_tool(&tools, "exec") else {
+        panic!("expected freeform tool");
+    };
 
-    assert_eq!(
-        description,
-        r#"Echo text
+    assert!(description.contains(
+        r#"### `mcp__sample__echo`
+Echo text
 
 exec tool declaration:
 ```ts
 declare const tools: { mcp__sample__echo(args: { message: string; }): Promise<CallToolResult>; };
 ```"#
-    );
+    ));
 }
 
 #[test]
@@ -2220,7 +2240,7 @@ fn code_mode_augments_builtin_tool_descriptions_with_typed_sample() {
 
     assert_eq!(
         description,
-        "View a local image from the filesystem (only use if given a full filepath by the user, and the image isn't already attached to the thread context within <image ...> tags).\n\nexec tool declaration:\n```ts\ndeclare const tools: { view_image(args: {\n  // Local filesystem path to an image file\n  path: string;\n}): Promise<{\n  // Image detail hint returned by view_image. Returns `original` when original resolution is preserved, otherwise `null`.\n  detail: string | null;\n  // Data URL for the loaded image.\n  image_url: string;\n}>; };\n```"
+        "View a local image from the filesystem (only use if given a full filepath by the user, and the image isn't already attached to the thread context within <image ...> tags).\n\nexec tool declaration:\n```ts\ndeclare const tools: { view_image(args: {\n  // Local filesystem path to an image file\n  path: string;\n}): Promise<{\n  // Image detail hint returned by view_image. Returns `high` for default resized behavior or `original` when original resolution is preserved.\n  detail: \"high\" | \"original\";\n  // Data URL for the loaded image.\n  image_url: string;\n}>; };\n```"
     );
 }
 
@@ -2254,9 +2274,8 @@ fn code_mode_only_exec_description_includes_full_nested_tool_details() {
 
     assert!(!description.contains("Enabled nested tools:"));
     assert!(!description.contains("Nested tool reference:"));
-    assert!(description.starts_with(
-        "Use `exec/wait` tool to run all other tools, do not attempt to use any other tools directly"
-    ));
+    assert!(description.starts_with("Run JavaScript code to orchestrate/compose tool calls"));
+    assert!(!description.contains("do not attempt to use any other tools directly"));
     assert!(description.contains("### `update_plan`"));
     assert!(description.contains("### `view_image`"));
 }
@@ -2279,16 +2298,16 @@ fn code_mode_only_exec_description_includes_extension_tool_details() {
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
     });
 
-    let extension_tool_bundles = vec![extension_tool_bundle(
+    let extension_tool_executors = vec![extension_tool_executor(
         "extension_echo",
         "Echoes arguments through an extension tool.",
     )];
-    let (tools, _) = build_specs_with_discoverable_tools(
+    let (tools, _) = build_specs_with_inputs_for_test(
         &tools_config,
         /*mcp_tools*/ None,
         /*deferred_mcp_tools*/ None,
         /*discoverable_tools*/ None,
-        &extension_tool_bundles,
+        &extension_tool_executors,
         &[],
     );
     let ToolSpec::Freeform(FreeformTool { description, .. }) = find_tool(&tools, "exec") else {
@@ -2381,22 +2400,22 @@ fn build_specs(
     deferred_mcp_tools: Option<Vec<ToolInfo>>,
     dynamic_tools: &[DynamicToolSpec],
 ) -> (Vec<ToolSpec>, ToolRegistry) {
-    build_specs_with_discoverable_tools(
+    build_specs_with_inputs_for_test(
         config,
         mcp_tools,
         deferred_mcp_tools,
         /*discoverable_tools*/ None,
-        /*extension_tool_bundles*/ &[],
+        /*extension_tool_executors*/ &[],
         dynamic_tools,
     )
 }
 
-fn build_specs_with_discoverable_tools(
+fn build_specs_with_inputs_for_test(
     config: &ToolsConfig,
     mcp_tools: Option<HashMap<ToolName, rmcp::model::Tool>>,
     deferred_mcp_tools: Option<Vec<ToolInfo>>,
     discoverable_tools: Option<Vec<DiscoverableTool>>,
-    extension_tool_bundles: &[codex_tool_api::ToolBundle],
+    extension_tool_executors: &[Arc<dyn ToolExecutor<ExtensionToolCall>>],
     dynamic_tools: &[DynamicToolSpec],
 ) -> (Vec<ToolSpec>, ToolRegistry) {
     let mcp_tool_inputs = mcp_tools.as_ref().map(|mcp_tools| {
@@ -2405,19 +2424,19 @@ fn build_specs_with_discoverable_tools(
             .map(|(name, tool)| tool_info_from_parts(name, tool.clone()))
             .collect::<Vec<_>>()
     });
-    let builder = build_tool_registry_builder(
-        config,
-        ToolRegistryBuildParams {
-            mcp_tools: mcp_tool_inputs.as_deref(),
-            deferred_mcp_tools: deferred_mcp_tools.as_deref(),
-            discoverable_tools: discoverable_tools.as_deref(),
-            extension_tool_bundles,
-            dynamic_tools,
-            default_agent_type_description: DEFAULT_AGENT_TYPE_DESCRIPTION,
-            wait_agent_timeouts: wait_agent_timeout_options(),
-        },
-    );
-    builder.build()
+    let params = ToolRegistryBuildParams {
+        mcp_tools: mcp_tool_inputs.as_deref(),
+        deferred_mcp_tools: deferred_mcp_tools.as_deref(),
+        discoverable_tools: discoverable_tools.as_deref(),
+        extension_tool_executors,
+        dynamic_tools,
+        default_agent_type_description: DEFAULT_AGENT_TYPE_DESCRIPTION,
+        wait_agent_timeouts: wait_agent_timeout_options(),
+    };
+    let mut executors = collect_tool_executors(config, params);
+    append_tool_search_executor(config, &mut executors);
+    prepend_code_mode_executors(config, &mut executors);
+    build_model_visible_specs_and_registry(config, executors, hosted_model_tool_specs(config))
 }
 
 fn mcp_tool(name: &str, description: &str, input_schema: serde_json::Value) -> rmcp::model::Tool {
@@ -2519,18 +2538,19 @@ fn code_mode_augments_mcp_tool_descriptions_with_structured_output_sample() {
         &[],
     );
 
-    let ResponsesApiTool { description, .. } =
-        find_namespace_function_tool(&tools, "mcp__sample__", "echo");
+    let ToolSpec::Freeform(FreeformTool { description, .. }) = find_tool(&tools, "exec") else {
+        panic!("expected freeform tool");
+    };
 
-    assert_eq!(
-        description,
-        r#"Echo text
+    assert!(description.contains(
+        r#"### `mcp__sample__echo`
+Echo text
 
 exec tool declaration:
 ```ts
 declare const tools: { mcp__sample__echo(args: { message: string; }): Promise<CallToolResult<{ echo: string; env: string | null; }>>; };
 ```"#
-    );
+    ));
 }
 
 fn discoverable_connector(id: &str, name: &str, description: &str) -> DiscoverableTool {
@@ -2759,7 +2779,6 @@ fn strip_descriptions_tool(spec: &mut ToolSpec) {
             }
         }
         ToolSpec::Freeform(FreeformTool { .. })
-        | ToolSpec::LocalShell {}
         | ToolSpec::ImageGeneration { .. }
         | ToolSpec::WebSearch { .. } => {}
     }
