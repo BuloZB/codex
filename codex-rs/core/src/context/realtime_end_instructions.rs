@@ -17,7 +17,7 @@ impl RealtimeEndInstructions {
 }
 
 impl ContextualUserFragment for RealtimeEndInstructions {
-    fn role() -> &'static str {
+    fn role(&self) -> &'static str {
         "developer"
     }
 
@@ -30,6 +30,10 @@ impl ContextualUserFragment for RealtimeEndInstructions {
             REALTIME_CONVERSATION_OPEN_TAG,
             REALTIME_CONVERSATION_CLOSE_TAG,
         )
+    }
+
+    fn matches_text(text: &str) -> bool {
+        text.contains(END_INSTRUCTIONS.trim())
     }
 
     fn body(&self) -> String {
