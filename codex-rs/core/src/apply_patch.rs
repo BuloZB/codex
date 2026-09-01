@@ -1,7 +1,8 @@
 use crate::function_tool::FunctionCallError;
 use crate::safety::SafetyCheck;
 use crate::safety::assess_patch_safety;
-use crate::session::turn_context::TurnContext;
+use crate::session::step_context::StepContext;
+use crate::session::turn_context::TurnEnvironment;
 use crate::tools::sandboxing::ExecApprovalRequirement;
 use codex_apply_patch::ApplyPatchAction;
 use codex_apply_patch::ApplyPatchFileChange;
@@ -19,17 +20,18 @@ pub(crate) struct ApplyPatchRuntimeInvocation {
 }
 
 pub(crate) fn prepare_apply_patch(
-    turn_context: &TurnContext,
+    step_context: &StepContext,
+    turn_environment: &TurnEnvironment,
     file_system_sandbox_policy: &FileSystemSandboxPolicy,
     action: ApplyPatchAction,
 ) -> Result<ApplyPatchRuntimeInvocation, FunctionCallError> {
     match assess_patch_safety(
         &action,
-        turn_context.approval_policy.value(),
-        &turn_context.permission_profile(),
+        step_context.settings.approval_policy(),
+        turn_environment.permission_profile(),
         file_system_sandbox_policy,
         &action.cwd,
-        turn_context.windows_sandbox_level,
+        turn_environment.config().windows_sandbox_level,
     ) {
         SafetyCheck::AutoApprove => Ok(ApplyPatchRuntimeInvocation {
             action,
